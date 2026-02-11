@@ -143,15 +143,24 @@ client.on('interactionCreate', async (interaction) => {
         user: interaction.user?.username,
         channelId: interaction.channelId,
         attachmentUrl: attachment?.url,
+        proxyUrl: attachment?.proxyURL,
         filename: attachment?.name,
       });
 
-      // 1) download attachment from Discord CDN
-      const imgResp = await axios.get(attachment.url, {
-        responseType: 'arraybuffer',
-        timeout: 60_000,
-        headers: { 'User-Agent': 'Idrogrow-Autopost/1.0' },
-      });
+      // 1) download attachment from Discord CDN (safe version)
+      // proxyURL è più affidabile degli ephemeral attachments
+  const downloadUrl = attachment.proxyURL || attachment.url;
+
+    console.log("Downloading image from:", downloadUrl);
+
+  const imgResp = await axios.get(downloadUrl, {
+    responseType: 'arraybuffer',
+    timeout: 10000, // ridotto per evitare timeout Discord
+    headers: {
+      'User-Agent': 'Mozilla/5.0'
+    }
+    });
+
 
       const imgBuffer = Buffer.from(imgResp.data);
 
@@ -311,3 +320,4 @@ http
   .listen(PORT, () => {
     console.log(`🌐 Health server listening on ${PORT}`);
   });
+
