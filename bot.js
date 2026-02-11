@@ -10,6 +10,9 @@ import axios from 'axios';
 import FormData from 'form-data';
 import http from 'http';
 
+/** =========================
+ *  Global crash protection
+ *  ========================= */
 process.on('unhandledRejection', (reason) => {
   console.error('UnhandledRejection:', reason);
 });
@@ -18,8 +21,9 @@ process.on('uncaughtException', (err) => {
   console.error('UncaughtException:', err);
 });
 
-
-// ===== ENV =====
+/** =========================
+ *  ENV
+ *  ========================= */
 const token = process.env.DISCORD_BOT_TOKEN;
 const clientId = process.env.DISCORD_CLIENT_ID;
 
@@ -32,7 +36,7 @@ const DEFAULT_LANGUAGE = (process.env.DEFAULT_LANGUAGE || 'it').toLowerCase();
 const DEFAULT_TARGET = (process.env.DEFAULT_TARGET || 'b2b').toLowerCase();
 const DEFAULT_BRAND = process.env.DEFAULT_BRAND || 'idrogrow.com';
 
-// Render Web Service requires a port
+// Render Web Service requires a port bind
 const PORT = process.env.PORT || 10000;
 
 function requireEnv(name, value) {
@@ -50,37 +54,52 @@ console.log('N8N_DRAFT_WEBHOOK_URL:', n8nDraftUrl);
 console.log('N8N_APPROVE_WEBHOOK_URL:', n8nApproveUrl);
 console.log('ALLOWED_CHANNEL_ID:', allowedChannelId);
 
-// ===== DISCORD CLIENT =====
+/** =========================
+ *  DISCORD CLIENT
+ *  ========================= */
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// ===== SLASH COMMANDS =====
+client.on('error', (e) => console.error('Discord client error:', e));
+client.on('shardError', (e) => console.error('Discord shard error:', e));
+
+/** =========================
+ *  SLASH COMMANDS
+ *  ========================= */
 const commands = [
   new SlashCommandBuilder()
     .setName('post')
-    .setDescription('Crea BOZZA multipiattaforma da immagine + descrizione (richiede approvazione)')
-    .addStringOption(opt =>
+    .setDescription(
+      'Crea BOZZA multipiattaforma da immagine + descrizione (richiede approvazione)'
+    )
+    .addStringOption((opt) =>
       opt.setName('descrizione').setDescription('Testo base').setRequired(true)
     )
-    .addAttachmentOption(opt =>
-      opt.setName('immagine').setDescription('Immagine da usare').setRequired(true)
+    .addAttachmentOption((opt) =>
+      opt
+        .setName('immagine')
+        .setDescription('Immagine da usare')
+        .setRequired(true)
     )
-    .addStringOption(opt =>
+    .addStringOption((opt) =>
       opt.setName('lingua').setDescription('it / en').setRequired(false)
     )
-    .addStringOption(opt =>
+    .addStringOption((opt) =>
       opt.setName('target').setDescription('b2b / b2c').setRequired(false)
     )
-    .addStringOption(opt =>
+    .addStringOption((opt) =>
       opt.setName('link').setDescription('Link (opzionale)').setRequired(false)
     )
-    .addStringOption(opt =>
-      opt.setName('brand').setDescription('Brand (opzionale)').setRequired(false)
+    .addStringOption((opt) =>
+      opt
+        .setName('brand')
+        .setDescription('Brand (opzionale)')
+        .setRequired(false)
     ),
 
   new SlashCommandBuilder()
     .setName('approvato')
     .setDescription('Approva e avvia pubblicazione su una piattaforma o su tutte')
-    .addStringOption(opt =>
+    .addStringOption((opt) =>
       opt
         .setName('piattaforma')
         .setDescription('facebook / instagram / x / tiktok / signal / all')
@@ -94,10 +113,10 @@ const commands = [
           { name: 'all', value: 'all' }
         )
     )
-    .addStringOption(opt =>
+    .addStringOption((opt) =>
       opt.setName('token').setDescription('Approval token').setRequired(true)
     ),
-].map(c => c.toJSON());
+].map((c) => c.toJSON());
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(token);
@@ -105,6 +124,9 @@ async function registerCommands() {
   console.log('✅ Slash commands registered');
 }
 
+/** =========================
+ *  HELPERS
+ *  ========================= */
 function chunkText(text, max = 1800) {
   const chunks = [];
   let s = text || '';
@@ -118,10 +140,14 @@ function chunkText(text, max = 1800) {
 
 async function ensureAllowedChannel(interaction) {
   if (interaction.channelId !== allowedChannelId) {
-    await interaction.reply({
-      ephemeral: true,
-      content: `⛔ Usa i comandi solo nel canale <#${allowedChannelId}>.`,
-    });
+    try {
+      await interaction.reply({
+        ephemeral: true,
+        content: `⛔ Usa i comandi solo nel canale <#${allowedChannelId}>.`,
+      });
+    } catch (e) {
+      console.error('ensureAllowedChannel reply failed:', e?.code || e?.message);
+    }
     return false;
   }
   return true;
@@ -140,24 +166,28 @@ async function safeDefer(interaction) {
   }
 }
 
-// ===== MAIN HANDLER =====
+/** =========================
+ *  MAIN HANDLER
+ *  ========================= */
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  // allowlist
   if (!(await ensureAllowedChannel(interaction))) return;
 
-  // /post
+  /** -------- /post -------- */
   if (interaction.commandName === 'post') {
-    // IMPORTANT: defer immediately to avoid 3s timeout
-  const ok = await safeDefer(interaction);
+    const ok = await safeDefer(interaction);
     if (!ok) return;
 
     const description = interaction.options.getString('descrizione', true);
     const attachment = interaction.options.getAttachment('immagine', true);
 
-    const language = (interaction.options.getString('lingua') || DEFAULT_LANGUAGE).toLowerCase();
-    const target = (interaction.options.getString('target') || DEFAULT_TARGET).toLowerCase();
+    const language = (
+      interaction.options.getString('lingua') || DEFAULT_LANGUAGE
+    ).toLowerCase();
+    const target = (
+      interaction.options.getString('target') || DEFAULT_TARGET
+    ).toLowerCase();
     const link = interaction.options.getString('link') || '';
     const brand = interaction.options.getString('brand') || DEFAULT_BRAND;
 
@@ -170,20 +200,16 @@ client.on('interactionCreate', async (interaction) => {
         filename: attachment?.name,
       });
 
-      // 1) download attachment from Discord CDN (safe version)
-      // proxyURL è più affidabile degli ephemeral attachments
-  const downloadUrl = attachment.proxyURL || attachment.url;
+      // 1) download attachment (proxyURL is often more stable)
+      const downloadUrl = attachment.proxyURL || attachment.url;
+      console.log('Downloading image from:', downloadUrl);
 
-    console.log("Downloading image from:", downloadUrl);
-
-  const imgResp = await axios.get(downloadUrl, {
-    responseType: 'arraybuffer',
-    timeout: 10000, // ridotto per evitare timeout Discord
-    headers: {
-      'User-Agent': 'Mozilla/5.0'
-    }
-    });
-
+      const imgResp = await axios.get(downloadUrl, {
+        responseType: 'arraybuffer',
+        timeout: 10_000,
+        maxBodyLength: Infinity,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      });
 
       const imgBuffer = Buffer.from(imgResp.data);
 
@@ -217,8 +243,11 @@ client.on('interactionCreate', async (interaction) => {
         throw new Error(data?.error || 'n8n returned ok=false');
       }
 
-      // 3) create thread + post copy blocks
-      const threadTitle = `Bozza social • ${new Date().toLocaleDateString('it-IT')} • ${interaction.user.username}`;
+      // 3) create thread
+      const threadTitle = `Bozza social • ${new Date().toLocaleDateString(
+        'it-IT'
+      )} • ${interaction.user.username}`;
+
       const thread = await interaction.channel.threads.create({
         name: threadTitle.slice(0, 95),
         autoArchiveDuration: 1440,
@@ -255,7 +284,6 @@ client.on('interactionCreate', async (interaction) => {
 
       await interaction.editReply(`✅ Bozza creata nel thread: <#${thread.id}>`);
       return;
-
     } catch (err) {
       const status = err?.response?.status;
       const respData = err?.response?.data;
@@ -263,21 +291,24 @@ client.on('interactionCreate', async (interaction) => {
 
       console.error('❌ /post failed:', { status, respData, msg });
 
-      await interaction.editReply(
-        `❌ Errore generazione bozza.\n` +
-        `status: ${status ?? 'n/a'}\n` +
-        `msg: ${msg ?? 'n/a'}\n` +
-        `data: ${respData ? JSON.stringify(respData).slice(0, 800) : 'n/a'}`
-      );
+      try {
+        await interaction.editReply(
+          `❌ Errore generazione bozza.\n` +
+            `status: ${status ?? 'n/a'}\n` +
+            `msg: ${msg ?? 'n/a'}\n` +
+            `data: ${respData ? JSON.stringify(respData).slice(0, 800) : 'n/a'}`
+        );
+      } catch (e) {
+        console.error('editReply failed:', e?.code || e?.message);
+      }
       return;
     }
   }
 
-  // /approvato
+  /** -------- /approvato -------- */
   if (interaction.commandName === 'approvato') {
     const ok = await safeDefer(interaction);
-  if (!ok) return;
-
+    if (!ok) return;
 
     const platform = interaction.options.getString('piattaforma', true);
     const approvalToken = interaction.options.getString('token', true).trim();
@@ -300,11 +331,10 @@ client.on('interactionCreate', async (interaction) => {
         `✅ Approvazione inviata → **${platform.toUpperCase()}** (token: \`${approvalToken}\`)`
       );
 
-      // confirmation in channel/thread
+      // Optional: message in channel (can be noisy)
       await interaction.channel.send(
         `✅ **APPROVATO** → **${platform.toUpperCase()}**\nToken: \`${approvalToken}\``
       );
-
     } catch (err) {
       const status = err?.response?.status;
       const respData = err?.response?.data;
@@ -312,26 +342,33 @@ client.on('interactionCreate', async (interaction) => {
 
       console.error('❌ /approvato failed:', { status, respData, msg });
 
-      await interaction.editReply(
-        `❌ Errore approvazione.\n` +
-        `status: ${status ?? 'n/a'}\n` +
-        `msg: ${msg ?? 'n/a'}\n` +
-        `data: ${respData ? JSON.stringify(respData).slice(0, 800) : 'n/a'}`
-      );
+      try {
+        await interaction.editReply(
+          `❌ Errore approvazione.\n` +
+            `status: ${status ?? 'n/a'}\n` +
+            `msg: ${msg ?? 'n/a'}\n` +
+            `data: ${respData ? JSON.stringify(respData).slice(0, 800) : 'n/a'}`
+        );
+      } catch (e) {
+        console.error('editReply failed:', e?.code || e?.message);
+      }
     }
   }
 });
 
-// ===== READY =====
+/** =========================
+ *  READY
+ *  ========================= */
 client.once('clientReady', () => {
   console.log(`🤖 Logged as ${client.user.tag}`);
 });
 
-// Start discord + register commands
 await registerCommands();
 client.login(token);
 
-// ===== HEALTH SERVER (Render Web Service) =====
+/** =========================
+ *  HEALTH SERVER (Render)
+ *  ========================= */
 http
   .createServer((req, res) => {
     if (req.url === '/health') {
@@ -345,5 +382,3 @@ http
   .listen(PORT, () => {
     console.log(`🌐 Health server listening on ${PORT}`);
   });
-
-
