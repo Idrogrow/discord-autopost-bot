@@ -1,9 +1,3 @@
-// bot.js
-// Discord bot: /post (draft) + /approvato (approve)
-// Sends image+description to n8n Draft webhook (multipart with binary field "image")
-// Sends approval_token + platform to n8n Approve webhook (JSON)
-// Restricts usage to one channel: ALLOWED_CHANNEL_ID
-
 import 'dotenv/config';
 import {
   Client,
@@ -14,7 +8,9 @@ import {
 } from 'discord.js';
 import axios from 'axios';
 import FormData from 'form-data';
+import http from 'http';
 
+// ===== ENV VARS =====
 const token = process.env.DISCORD_BOT_TOKEN;
 const clientId = process.env.DISCORD_CLIENT_ID;
 
@@ -27,41 +23,46 @@ const DEFAULT_LANGUAGE = (process.env.DEFAULT_LANGUAGE || 'it').toLowerCase();
 const DEFAULT_TARGET = (process.env.DEFAULT_TARGET || 'b2b').toLowerCase();
 const DEFAULT_BRAND = process.env.DEFAULT_BRAND || 'idrogrow.com';
 
+// ===== VALIDATION =====
 if (!token || !clientId || !n8nDraftUrl || !n8nApproveUrl || !allowedChannelId) {
   throw new Error(
-    'Missing required env vars. Required: DISCORD_BOT_TOKEN, DISCORD_CLIENT_ID, N8N_DRAFT_WEBHOOK_URL, N8N_APPROVE_WEBHOOK_URL, ALLOWED_CHANNEL_ID'
+    'Missing required environment variables. Check Render settings.'
   );
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+// ===== DISCORD CLIENT =====
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds],
+});
 
+// ===== SLASH COMMANDS =====
 const commands = [
   new SlashCommandBuilder()
     .setName('post')
-    .setDescription('Crea BOZZA multipiattaforma da immagine + descrizione (richiede approvazione)')
-    .addStringOption((opt) =>
+    .setDescription('Crea BOZZA multipiattaforma da immagine + descrizione')
+    .addStringOption(opt =>
       opt.setName('descrizione').setDescription('Testo base').setRequired(true)
     )
-    .addAttachmentOption((opt) =>
+    .addAttachmentOption(opt =>
       opt.setName('immagine').setDescription('Immagine da usare').setRequired(true)
     )
-    .addStringOption((opt) =>
+    .addStringOption(opt =>
       opt.setName('lingua').setDescription('it / en').setRequired(false)
     )
-    .addStringOption((opt) =>
+    .addStringOption(opt =>
       opt.setName('target').setDescription('b2b / b2c').setRequired(false)
     )
-    .addStringOption((opt) =>
-      opt.setName('link').setDescription('Link prodotto/pagina (opzionale)').setRequired(false)
+    .addStringOption(opt =>
+      opt.setName('link').setDescription('Link (opzionale)').setRequired(false)
     )
-    .addStringOption((opt) =>
-      opt.setName('brand').setDescription('Brand/account (opzionale)').setRequired(false)
+    .addStringOption(opt =>
+      opt.setName('brand').setDescription('Brand (opzionale)').setRequired(false)
     ),
 
   new SlashCommandBuilder()
     .setName('approvato')
-    .setDescription('Approva e avvia pubblicazione su una piattaforma o su tutte')
-    .addStringOption((opt) =>
+    .setDescription('Approva e pubblica su una piattaforma o su tutte')
+    .addStringOption(opt =>
       opt
         .setName('piattaforma')
         .setDescription('facebook / instagram / x / tiktok / signal / all')
@@ -75,17 +76,19 @@ const commands = [
           { name: 'all', value: 'all' }
         )
     )
-    .addStringOption((opt) =>
+    .addStringOption(opt =>
       opt.setName('token').setDescription('Approval token').setRequired(true)
     ),
-].map((c) => c.toJSON());
+].map(c => c.toJSON());
 
+// ===== REGISTER COMMANDS =====
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(token);
   await rest.put(Routes.applicationCommands(clientId), { body: commands });
   console.log('✅ Slash commands registered');
 }
 
+// ===== UTILS =====
 function chunkText(text, max = 1800) {
   const chunks = [];
   let s = text || '';
@@ -108,42 +111,41 @@ async function ensureAllowedChannel(interaction) {
   return true;
 }
 
+// ===== INTERACTIONS =====
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-
-  // Restrict to the allowed channel
   if (!(await ensureAllowedChannel(interaction))) return;
 
-  // /post
+  // ===== /POST =====
   if (interaction.commandName === 'post') {
     const description = interaction.options.getString('descrizione', true);
     const attachment = interaction.options.getAttachment('immagine', true);
 
-    const language = (interaction.options.getString('lingua') || DEFAULT_LANGUAGE).toLowerCase();
-    const target = (interaction.options.getString('target') || DEFAULT_TARGET).toLowerCase();
+    const language =
+      (interaction.options.getString('lingua') || DEFAULT_LANGUAGE).toLowerCase();
+    const target =
+      (interaction.options.getString('target') || DEFAULT_TARGET).toLowerCase();
     const link = interaction.options.getString('link') || '';
     const brand = interaction.options.getString('brand') || DEFAULT_BRAND;
 
     await interaction.deferReply({ ephemeral: true });
 
     try {
-      // Download the attachment binary from Discord CDN
-      const imgResp = await axios.get(attachment.url, { responseType: 'arraybuffer' });
+      const imgResp = await axios.get(attachment.url, {
+        responseType: 'arraybuffer',
+      });
       const imgBuffer = Buffer.from(imgResp.data);
 
-      // Send multipart to n8n
       const form = new FormData();
       form.append('description', description);
       form.append('language', language);
       form.append('target', target);
       form.append('link', link);
       form.append('brand', brand);
-
       form.append('discord_guild_id', interaction.guildId || '');
       form.append('discord_channel_id', interaction.channelId || '');
       form.append('discord_user', interaction.user?.username || '');
 
-      // IMPORTANT: field name must be "image" (matches n8n webhook binary field)
       form.append('image', imgBuffer, {
         filename: attachment.name || 'image.jpg',
         contentType: attachment.contentType || 'image/jpeg',
@@ -151,35 +153,24 @@ client.on('interactionCreate', async (interaction) => {
 
       const n8nResp = await axios.post(n8nDraftUrl, form, {
         headers: form.getHeaders(),
-        timeout: 90_000,
+        timeout: 90000,
       });
 
       const data = n8nResp.data;
       if (!data?.ok) throw new Error(data?.error || 'n8n returned ok=false');
 
-      // Create a thread for the draft
-      const threadTitle = `Bozza social • ${new Date().toLocaleDateString('it-IT')} • ${interaction.user.username}`;
       const thread = await interaction.channel.threads.create({
-        name: threadTitle.slice(0, 95),
-        autoArchiveDuration: 1440, // 24h
-        reason: 'Auto post social draft',
+        name: `Bozza social • ${interaction.user.username}`,
+        autoArchiveDuration: 1440,
       });
 
-      // Header with instructions
-      const header =
-        `🧾 **BOZZA GENERATA (PENDING APPROVAL)**\n` +
-        `👤 Richiesta da: **${interaction.user.username}**\n` +
-        `🧩 Token: \`${data.approval_token}\`\n` +
-        (data.stable_media_url ? `🖼️ Media: ${data.stable_media_url}\n` : '') +
-        `\n✅ Per pubblicare:\n` +
-        `- \`/approvato piattaforma:facebook token:${data.approval_token}\`\n` +
-        `- \`/approvato piattaforma:instagram token:${data.approval_token}\`\n` +
-        `- \`/approvato piattaforma:x token:${data.approval_token}\`\n` +
-        `- \`/approvato piattaforma:all token:${data.approval_token}\`\n`;
+      await thread.send(
+        `🧾 **BOZZA GENERATA (PENDING APPROVAL)**\n🧩 Token: \`${data.approval_token}\`\n\n` +
+          `Per pubblicare:\n` +
+          `\`/approvato piattaforma:facebook token:${data.approval_token}\`\n` +
+          `\`/approvato piattaforma:all token:${data.approval_token}\`\n`
+      );
 
-      await thread.send(header);
-
-      // Send platform copies
       const blocks = [
         { title: 'INSTAGRAM', body: data.ig_caption },
         { title: 'FACEBOOK', body: data.fb_text },
@@ -195,53 +186,63 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
 
-      await interaction.editReply({
-        content: `✅ Bozza creata nel thread: <#${thread.id}> (token: \`${data.approval_token}\`)`,
-      });
+      await interaction.editReply(`✅ Bozza creata nel thread <#${thread.id}>`);
     } catch (err) {
       console.error(err);
-      await interaction.editReply(
-        '❌ Errore: bozza non generata. Controlla webhook n8n (Production URL) e workflow Active.'
-      );
+      await interaction.editReply('❌ Errore generazione bozza.');
     }
-    return;
   }
 
-  // /approvato
+  // ===== /APPROVATO =====
   if (interaction.commandName === 'approvato') {
     const platform = interaction.options.getString('piattaforma', true);
-    const approvalToken = interaction.options.getString('token', true).trim();
+    const approvalToken = interaction.options.getString('token', true);
 
     await interaction.deferReply({ ephemeral: true });
 
     try {
-      const resp = await axios.post(
-        n8nApproveUrl,
-        { approval_token: approvalToken, platform },
-        { timeout: 60_000 }
-      );
+      const resp = await axios.post(n8nApproveUrl, {
+        approval_token: approvalToken,
+        platform,
+      });
 
       const data = resp.data;
-      if (!data?.ok) throw new Error(data?.error || 'n8n returned ok=false');
 
       await interaction.editReply(
-        `✅ Approvazione inviata: **${platform.toUpperCase()}** (token: \`${approvalToken}\`)\nStatus: **${data.status || 'OK'}**`
+        `✅ Approvazione inviata → ${platform.toUpperCase()}`
       );
 
-      // Post a public confirmation in the channel (or current thread)
       await interaction.channel.send(
-        `✅ **APPROVATO** → **${platform.toUpperCase()}**\nToken: \`${approvalToken}\`\nStatus: **${data.status || 'OK'}**`
+        `✅ APPROVATO → ${platform.toUpperCase()} | Token: \`${approvalToken}\``
       );
     } catch (err) {
       console.error(err);
-      await interaction.editReply(
-        '❌ Errore: approvazione fallita. Controlla webhook approve n8n e log.'
-      );
+      await interaction.editReply('❌ Errore approvazione.');
     }
   }
 });
 
-client.once('ready', () => console.log(`🤖 Logged as ${client.user.tag}`));
+// ===== READY =====
+client.once('clientReady', () => {
+  console.log(`🤖 Logged as ${client.user.tag}`);
+});
 
 await registerCommands();
 client.login(token);
+
+// ===== HEALTH SERVER FOR RENDER =====
+const PORT = process.env.PORT || 10000;
+
+http
+  .createServer((req, res) => {
+    if (req.url === '/health') {
+      res.writeHead(200);
+      res.end('OK');
+      return;
+    }
+    res.writeHead(200);
+    res.end('Discord bot running');
+  })
+  .listen(PORT, () =>
+    console.log(`🌐 Health server listening on port ${PORT}`)
+  );
