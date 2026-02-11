@@ -10,6 +10,15 @@ import axios from 'axios';
 import FormData from 'form-data';
 import http from 'http';
 
+process.on('unhandledRejection', (reason) => {
+  console.error('UnhandledRejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('UncaughtException:', err);
+});
+
+
 // ===== ENV =====
 const token = process.env.DISCORD_BOT_TOKEN;
 const clientId = process.env.DISCORD_CLIENT_ID;
@@ -118,6 +127,19 @@ async function ensureAllowedChannel(interaction) {
   return true;
 }
 
+async function safeDefer(interaction) {
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ ephemeral: true });
+    }
+    return true;
+  } catch (e) {
+    // 10062 = Unknown interaction (expired)
+    console.error('safeDefer failed:', e?.code || e?.message, e?.rawError || '');
+    return false;
+  }
+}
+
 // ===== MAIN HANDLER =====
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
@@ -128,7 +150,8 @@ client.on('interactionCreate', async (interaction) => {
   // /post
   if (interaction.commandName === 'post') {
     // IMPORTANT: defer immediately to avoid 3s timeout
-    await interaction.deferReply({ ephemeral: true });
+  const ok = await safeDefer(interaction);
+    if (!ok) return;
 
     const description = interaction.options.getString('descrizione', true);
     const attachment = interaction.options.getAttachment('immagine', true);
@@ -252,7 +275,9 @@ client.on('interactionCreate', async (interaction) => {
 
   // /approvato
   if (interaction.commandName === 'approvato') {
-    await interaction.deferReply({ ephemeral: true });
+    const ok = await safeDefer(interaction);
+  if (!ok) return;
+
 
     const platform = interaction.options.getString('piattaforma', true);
     const approvalToken = interaction.options.getString('token', true).trim();
@@ -320,4 +345,5 @@ http
   .listen(PORT, () => {
     console.log(`🌐 Health server listening on ${PORT}`);
   });
+
 
