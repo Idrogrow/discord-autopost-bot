@@ -16,7 +16,6 @@ import http from 'http';
 process.on('unhandledRejection', (reason) => {
   console.error('UnhandledRejection:', reason);
 });
-
 process.on('uncaughtException', (err) => {
   console.error('UncaughtException:', err);
 });
@@ -68,17 +67,12 @@ client.on('shardError', (e) => console.error('Discord shard error:', e));
 const commands = [
   new SlashCommandBuilder()
     .setName('post')
-    .setDescription(
-      'Crea BOZZA multipiattaforma da immagine + descrizione (richiede approvazione)'
-    )
+    .setDescription('Crea BOZZA multipiattaforma da immagine + descrizione (richiede approvazione)')
     .addStringOption((opt) =>
       opt.setName('descrizione').setDescription('Testo base').setRequired(true)
     )
     .addAttachmentOption((opt) =>
-      opt
-        .setName('immagine')
-        .setDescription('Immagine da usare')
-        .setRequired(true)
+      opt.setName('immagine').setDescription('Immagine da usare').setRequired(true)
     )
     .addStringOption((opt) =>
       opt.setName('lingua').setDescription('it / en').setRequired(false)
@@ -90,10 +84,7 @@ const commands = [
       opt.setName('link').setDescription('Link (opzionale)').setRequired(false)
     )
     .addStringOption((opt) =>
-      opt
-        .setName('brand')
-        .setDescription('Brand (opzionale)')
-        .setRequired(false)
+      opt.setName('brand').setDescription('Brand (opzionale)').setRequired(false)
     ),
 
   new SlashCommandBuilder()
@@ -166,6 +157,39 @@ async function safeDefer(interaction) {
   }
 }
 
+async function safeEditReply(interaction, content) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(content);
+      return true;
+    }
+    await interaction.reply({ ephemeral: true, content });
+    return true;
+  } catch (e) {
+    console.error('safeEditReply failed:', e?.code || e?.message, e?.rawError || '');
+    return false;
+  }
+}
+
+/**
+ * n8n può rispondere:
+ * - JSON (oggetto)  -> ok
+ * - TEXT contenente JSON (string) -> va parsata
+ */
+function normalizeN8nData(raw) {
+  let data = raw;
+  if (typeof data === 'string') {
+    const trimmed = data.trim();
+    try {
+      data = JSON.parse(trimmed);
+    } catch {
+      // n8n ha risposto testo non JSON (oppure html)
+      throw new Error(`n8n returned non-JSON text: ${trimmed.slice(0, 200)}`);
+    }
+  }
+  return data;
+}
+
 /** =========================
  *  MAIN HANDLER
  *  ========================= */
@@ -182,12 +206,8 @@ client.on('interactionCreate', async (interaction) => {
     const description = interaction.options.getString('descrizione', true);
     const attachment = interaction.options.getAttachment('immagine', true);
 
-    const language = (
-      interaction.options.getString('lingua') || DEFAULT_LANGUAGE
-    ).toLowerCase();
-    const target = (
-      interaction.options.getString('target') || DEFAULT_TARGET
-    ).toLowerCase();
+    const language = (interaction.options.getString('lingua') || DEFAULT_LANGUAGE).toLowerCase();
+    const target = (interaction.options.getString('target') || DEFAULT_TARGET).toLowerCase();
     const link = interaction.options.getString('link') || '';
     const brand = interaction.options.getString('brand') || DEFAULT_BRAND;
 
@@ -206,9 +226,10 @@ client.on('interactionCreate', async (interaction) => {
 
       const imgResp = await axios.get(downloadUrl, {
         responseType: 'arraybuffer',
-        timeout: 10_000,
+        timeout: 25_000,
         maxBodyLength: Infinity,
-        headers: { 'User-Agent': 'Mozilla/5.0' },
+        headers: { 'User-Agent': 'Mozilla/5.0 (Idrogrow-Autopost/1.0)' },
+        validateStatus: (s) => s >= 200 && s < 300,
       });
 
       const imgBuffer = Buffer.from(imgResp.data);
@@ -234,9 +255,20 @@ client.on('interactionCreate', async (interaction) => {
         headers: form.getHeaders(),
         timeout: 90_000,
         maxBodyLength: Infinity,
+        validateStatus: () => true, // gestiamo noi lo status
       });
 
-      const data = n8nResp.data;
+      if (n8nResp.status < 200 || n8nResp.status >= 300) {
+        throw new Error(
+          `n8n HTTP ${n8nResp.status}: ${
+            typeof n8nResp.data === 'string'
+              ? n8nResp.data.slice(0, 200)
+              : JSON.stringify(n8nResp.data).slice(0, 200)
+          }`
+        );
+      }
+
+      const data = normalizeN8nData(n8nResp.data);
       console.log('⬅️ n8n draft response:', data);
 
       if (!data?.ok) {
@@ -244,10 +276,7 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       // 3) create thread
-      const threadTitle = `Bozza social • ${new Date().toLocaleDateString(
-        'it-IT'
-      )} • ${interaction.user.username}`;
-
+      const threadTitle = `Bozza social • ${new Date().toLocaleDateString('it-IT')} • ${interaction.user.username}`;
       const thread = await interaction.channel.threads.create({
         name: threadTitle.slice(0, 95),
         autoArchiveDuration: 1440,
@@ -282,8 +311,9 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
 
-      await interaction.editReply(`✅ Bozza creata nel thread: <#${thread.id}>`);
+      await safeEditReply(interaction, `✅ Bozza creata nel thread: <#${thread.id}>`);
       return;
+
     } catch (err) {
       const status = err?.response?.status;
       const respData = err?.response?.data;
@@ -291,16 +321,19 @@ client.on('interactionCreate', async (interaction) => {
 
       console.error('❌ /post failed:', { status, respData, msg });
 
-      try {
-        await interaction.editReply(
-          `❌ Errore generazione bozza.\n` +
-            `status: ${status ?? 'n/a'}\n` +
-            `msg: ${msg ?? 'n/a'}\n` +
-            `data: ${respData ? JSON.stringify(respData).slice(0, 800) : 'n/a'}`
-        );
-      } catch (e) {
-        console.error('editReply failed:', e?.code || e?.message);
-      }
+      await safeEditReply(
+        interaction,
+        `❌ Errore generazione bozza.\n` +
+          `status: ${status ?? 'n/a'}\n` +
+          `msg: ${msg ?? 'n/a'}\n` +
+          `data: ${
+            respData
+              ? (typeof respData === 'string'
+                  ? respData.slice(0, 800)
+                  : JSON.stringify(respData).slice(0, 800))
+              : 'n/a'
+          }`
+      );
       return;
     }
   }
@@ -317,24 +350,39 @@ client.on('interactionCreate', async (interaction) => {
       const resp = await axios.post(
         n8nApproveUrl,
         { approval_token: approvalToken, platform },
-        { timeout: 60_000 }
+        {
+          timeout: 60_000,
+          validateStatus: () => true,
+        }
       );
 
-      const data = resp.data;
+      if (resp.status < 200 || resp.status >= 300) {
+        throw new Error(
+          `n8n HTTP ${resp.status}: ${
+            typeof resp.data === 'string'
+              ? resp.data.slice(0, 200)
+              : JSON.stringify(resp.data).slice(0, 200)
+          }`
+        );
+      }
+
+      const data = normalizeN8nData(resp.data);
       console.log('⬅️ n8n approve response:', data);
 
       if (!data?.ok) {
         throw new Error(data?.error || 'n8n returned ok=false');
       }
 
-      await interaction.editReply(
+      await safeEditReply(
+        interaction,
         `✅ Approvazione inviata → **${platform.toUpperCase()}** (token: \`${approvalToken}\`)`
       );
 
-      // Optional: message in channel (can be noisy)
+      // opzionale: se non vuoi spam, commentalo
       await interaction.channel.send(
         `✅ **APPROVATO** → **${platform.toUpperCase()}**\nToken: \`${approvalToken}\``
       );
+
     } catch (err) {
       const status = err?.response?.status;
       const respData = err?.response?.data;
@@ -342,16 +390,19 @@ client.on('interactionCreate', async (interaction) => {
 
       console.error('❌ /approvato failed:', { status, respData, msg });
 
-      try {
-        await interaction.editReply(
-          `❌ Errore approvazione.\n` +
-            `status: ${status ?? 'n/a'}\n` +
-            `msg: ${msg ?? 'n/a'}\n` +
-            `data: ${respData ? JSON.stringify(respData).slice(0, 800) : 'n/a'}`
-        );
-      } catch (e) {
-        console.error('editReply failed:', e?.code || e?.message);
-      }
+      await safeEditReply(
+        interaction,
+        `❌ Errore approvazione.\n` +
+          `status: ${status ?? 'n/a'}\n` +
+          `msg: ${msg ?? 'n/a'}\n` +
+          `data: ${
+            respData
+              ? (typeof respData === 'string'
+                  ? respData.slice(0, 800)
+                  : JSON.stringify(respData).slice(0, 800))
+              : 'n/a'
+          }`
+      );
     }
   }
 });
@@ -363,6 +414,7 @@ client.once('clientReady', () => {
   console.log(`🤖 Logged as ${client.user.tag}`);
 });
 
+// Start discord + register commands
 await registerCommands();
 client.login(token);
 
