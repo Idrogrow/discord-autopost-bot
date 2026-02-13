@@ -16,7 +16,6 @@ import http from 'http';
 process.on('unhandledRejection', (reason) => {
   console.error('UnhandledRejection:', reason);
 });
-
 process.on('uncaughtException', (err) => {
   console.error('UncaughtException:', err);
 });
@@ -29,6 +28,7 @@ const clientId = process.env.DISCORD_CLIENT_ID;
 
 const n8nDraftUrl = process.env.N8N_DRAFT_WEBHOOK_URL;
 const n8nApproveUrl = process.env.N8N_APPROVE_WEBHOOK_URL;
+const n8nLinkThreadUrl = process.env.N8N_LINK_THREAD_WEBHOOK_URL;
 
 const allowedChannelId = process.env.ALLOWED_CHANNEL_ID;
 
@@ -47,11 +47,13 @@ requireEnv('DISCORD_BOT_TOKEN', token);
 requireEnv('DISCORD_CLIENT_ID', clientId);
 requireEnv('N8N_DRAFT_WEBHOOK_URL', n8nDraftUrl);
 requireEnv('N8N_APPROVE_WEBHOOK_URL', n8nApproveUrl);
+requireEnv('N8N_LINK_THREAD_WEBHOOK_URL', n8nLinkThreadUrl);
 requireEnv('ALLOWED_CHANNEL_ID', allowedChannelId);
 
 console.log('✅ Booting Discord AutoPost Bot');
 console.log('N8N_DRAFT_WEBHOOK_URL:', n8nDraftUrl);
 console.log('N8N_APPROVE_WEBHOOK_URL:', n8nApproveUrl);
+console.log('N8N_LINK_THREAD_WEBHOOK_URL:', n8nLinkThreadUrl);
 console.log('ALLOWED_CHANNEL_ID:', allowedChannelId);
 
 /** =========================
@@ -98,7 +100,7 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('approvato')
-    .setDescription('Approva e avvia pubblicazione su una piattaforma o su tutte')
+    .setDescription('Approva e avvia pubblicazione su una piattaforma o su tutte (token automatico nel thread)')
     .addStringOption((opt) =>
       opt
         .setName('piattaforma')
@@ -113,8 +115,9 @@ const commands = [
           { name: 'all', value: 'all' }
         )
     )
+    // ✅ token ora NON obbligatorio
     .addStringOption((opt) =>
-      opt.setName('token').setDescription('Approval token').setRequired(true)
+      opt.setName('token').setDescription('Approval token (opzionale)').setRequired(false)
     ),
 ].map((c) => c.toJSON());
 
@@ -166,49 +169,32 @@ async function safeDefer(interaction) {
   }
 }
 
-/**
- * n8n può rispondere:
- * - oggetto JSON
- * - stringa che contiene JSON (es: JSON.stringify)
- * - array [{...}]
- * Questa funzione normalizza sempre a oggetto.
- */
-function normalizeN8nPayload(raw) {
-  if (raw == null) return null;
-
-  if (Array.isArray(raw)) raw = raw[0];
-
-  if (typeof raw === 'string') {
-    const t = raw.trim();
-
-    // parse diretto
-    try {
-      return JSON.parse(t);
-    } catch {
-      // fallback: estrai primo {...} dentro la stringa
-      const start = t.indexOf('{');
-      const end = t.lastIndexOf('}');
-      if (start !== -1 && end !== -1 && end > start) {
-        const candidate = t.slice(start, end + 1);
-        try {
-          return JSON.parse(candidate);
-        } catch {}
-      }
-      return {
-        ok: false,
-        error: 'n8n returned non-parseable JSON string',
-        raw: t.slice(0, 800),
-      };
+async function safeEditReply(interaction, content) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(content);
+    } else {
+      await interaction.reply({ ephemeral: true, content });
     }
+  } catch (e) {
+    console.error('safeEditReply failed:', e?.code || e?.message);
   }
+}
 
-  if (typeof raw === 'object') return raw;
-
-  return {
-    ok: false,
-    error: `Unexpected n8n response type: ${typeof raw}`,
-    raw,
-  };
+function parseN8nResponse(data) {
+  // n8n a volte risponde con TEXT contenente JSON (stringa)
+  if (typeof data === 'string') {
+    const s = data.trim();
+    if (s.startsWith('{') || s.startsWith('[')) {
+      try {
+        return JSON.parse(s);
+      } catch {
+        // fallthrough
+      }
+    }
+    return { ok: false, error: `n8n returned non-JSON text: ${s.slice(0, 200)}` };
+  }
+  return data;
 }
 
 /** =========================
@@ -245,7 +231,7 @@ client.on('interactionCreate', async (interaction) => {
         filename: attachment?.name,
       });
 
-      // 1) download attachment (proxyURL often more stable)
+      // 1) download attachment (proxyURL is often more stable)
       const downloadUrl = attachment.proxyURL || attachment.url;
       console.log('Downloading image from:', downloadUrl);
 
@@ -258,7 +244,7 @@ client.on('interactionCreate', async (interaction) => {
 
       const imgBuffer = Buffer.from(imgResp.data);
 
-      // 2) send multipart to n8n
+      // 2) send multipart to n8n (draft)
       const form = new FormData();
       form.append('description', description);
       form.append('language', language);
@@ -281,11 +267,8 @@ client.on('interactionCreate', async (interaction) => {
         maxBodyLength: Infinity,
       });
 
-      const rawData = n8nResp.data;
-      const data = normalizeN8nPayload(rawData);
-
-      console.log('⬅️ n8n draft response (raw):', rawData);
-      console.log('⬅️ n8n draft response (normalized):', data);
+      const data = parseN8nResponse(n8nResp.data);
+      console.log('⬅️ n8n draft response:', data);
 
       if (!data?.ok) {
         throw new Error(data?.error || 'n8n returned ok=false');
@@ -302,16 +285,34 @@ client.on('interactionCreate', async (interaction) => {
         reason: 'Auto post social draft',
       });
 
+      // 4) link token ↔ thread in sheet (NEW)
+      try {
+        await axios.post(
+          n8nLinkThreadUrl,
+          {
+            approval_token: data.approval_token,
+            discord_thread_id: thread.id,
+            discord_guild_id: interaction.guildId || '',
+            discord_channel_id: interaction.channelId || '',
+            discord_user: interaction.user?.username || '',
+          },
+          { timeout: 20_000 }
+        );
+      } catch (e) {
+        console.error('⚠️ link-thread failed (non blocco la bozza):', e?.message);
+      }
+
       const header =
         `🧾 **BOZZA GENERATA (PENDING APPROVAL)**\n` +
         `👤 Richiesta da: **${interaction.user.username}**\n` +
         `🧩 Token: \`${data.approval_token}\`\n` +
         (data.stable_media_url ? `🖼️ Media: ${data.stable_media_url}\n` : '') +
-        `\n✅ Per pubblicare:\n` +
-        `- \`/approvato piattaforma:facebook token:${data.approval_token}\`\n` +
-        `- \`/approvato piattaforma:instagram token:${data.approval_token}\`\n` +
-        `- \`/approvato piattaforma:x token:${data.approval_token}\`\n` +
-        `- \`/approvato piattaforma:all token:${data.approval_token}\`\n`;
+        `\n✅ Per pubblicare (nel thread, token automatico):\n` +
+        `- \`/approvato piattaforma:facebook\`\n` +
+        `- \`/approvato piattaforma:instagram\`\n` +
+        `- \`/approvato piattaforma:x\`\n` +
+        `- \`/approvato piattaforma:all\`\n` +
+        `\n(Se vuoi forzare: \`/approvato piattaforma:x token:${data.approval_token}\`)\n`;
 
       await thread.send(header);
 
@@ -330,7 +331,7 @@ client.on('interactionCreate', async (interaction) => {
         }
       }
 
-      await interaction.editReply(`✅ Bozza creata nel thread: <#${thread.id}>`);
+      await safeEditReply(interaction, `✅ Bozza creata nel thread: <#${thread.id}>`);
       return;
     } catch (err) {
       const status = err?.response?.status;
@@ -339,16 +340,13 @@ client.on('interactionCreate', async (interaction) => {
 
       console.error('❌ /post failed:', { status, respData, msg });
 
-      try {
-        await interaction.editReply(
-          `❌ Errore generazione bozza.\n` +
-            `status: ${status ?? 'n/a'}\n` +
-            `msg: ${msg ?? 'n/a'}\n` +
-            `data: ${respData ? JSON.stringify(respData).slice(0, 800) : 'n/a'}`
-        );
-      } catch (e) {
-        console.error('editReply failed:', e?.code || e?.message);
-      }
+      await safeEditReply(
+        interaction,
+        `❌ Errore generazione bozza.\n` +
+          `status: ${status ?? 'n/a'}\n` +
+          `msg: ${msg ?? 'n/a'}\n` +
+          `data: ${respData ? JSON.stringify(respData).slice(0, 800) : 'n/a'}`
+      );
       return;
     }
   }
@@ -359,32 +357,32 @@ client.on('interactionCreate', async (interaction) => {
     if (!ok) return;
 
     const platform = interaction.options.getString('piattaforma', true);
-    const approvalToken = interaction.options.getString('token', true).trim();
+    const approvalToken = (interaction.options.getString('token') || '').trim();
+
+    // Se NON metti token, devi lanciare il comando nel thread della bozza
+    const payload =
+      approvalToken
+        ? { approval_token: approvalToken, platform }
+        : {
+            platform,
+            discord_thread_id: interaction.channelId, // nel thread = threadId
+            discord_guild_id: interaction.guildId || '',
+            discord_user: interaction.user?.username || '',
+          };
 
     try {
-      const resp = await axios.post(
-        n8nApproveUrl,
-        { approval_token: approvalToken, platform },
-        { timeout: 60_000 }
-      );
+      const resp = await axios.post(n8nApproveUrl, payload, { timeout: 60_000 });
+      const data = parseN8nResponse(resp.data);
 
-      const rawData = resp.data;
-      const data = normalizeN8nPayload(rawData);
-
-      console.log('⬅️ n8n approve response (raw):', rawData);
-      console.log('⬅️ n8n approve response (normalized):', data);
+      console.log('⬅️ n8n approve response:', data);
 
       if (!data?.ok) {
         throw new Error(data?.error || 'n8n returned ok=false');
       }
 
-      await interaction.editReply(
-        `✅ Approvazione inviata → **${platform.toUpperCase()}** (token: \`${approvalToken}\`)`
-      );
-
-      // Optional: message in channel (can be noisy)
-      await interaction.channel.send(
-        `✅ **APPROVATO** → **${platform.toUpperCase()}**\nToken: \`${approvalToken}\``
+      await safeEditReply(
+        interaction,
+        `✅ Approvazione inviata → **${platform.toUpperCase()}**`
       );
     } catch (err) {
       const status = err?.response?.status;
@@ -393,16 +391,13 @@ client.on('interactionCreate', async (interaction) => {
 
       console.error('❌ /approvato failed:', { status, respData, msg });
 
-      try {
-        await interaction.editReply(
-          `❌ Errore approvazione.\n` +
-            `status: ${status ?? 'n/a'}\n` +
-            `msg: ${msg ?? 'n/a'}\n` +
-            `data: ${respData ? JSON.stringify(respData).slice(0, 800) : 'n/a'}`
-        );
-      } catch (e) {
-        console.error('editReply failed:', e?.code || e?.message);
-      }
+      await safeEditReply(
+        interaction,
+        `❌ Errore approvazione.\n` +
+          `status: ${status ?? 'n/a'}\n` +
+          `msg: ${msg ?? 'n/a'}\n` +
+          `data: ${respData ? JSON.stringify(respData).slice(0, 800) : 'n/a'}`
+      );
     }
   }
 });
@@ -414,7 +409,6 @@ client.once('clientReady', () => {
   console.log(`🤖 Logged as ${client.user.tag}`);
 });
 
-// Start discord + register commands
 await registerCommands();
 client.login(token);
 
