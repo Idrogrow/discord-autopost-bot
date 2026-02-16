@@ -29,7 +29,7 @@ const clientId = process.env.DISCORD_CLIENT_ID;
 const n8nDraftUrl = process.env.N8N_DRAFT_WEBHOOK_URL;
 const n8nApproveUrl = process.env.N8N_APPROVE_WEBHOOK_URL;
 
-// NEW: link thread -> token
+// OPTIONAL: workflow “link-thread” (thread_id <-> approval_token)
 const n8nLinkThreadUrl = process.env.N8N_LINK_THREAD_WEBHOOK_URL || "";
 
 const allowedChannelId = process.env.ALLOWED_CHANNEL_ID;
@@ -109,7 +109,6 @@ const commands = [
           { name: "all", value: "all" }
         )
     )
-    // token OPTIONAL now
     .addStringOption((opt) =>
       opt.setName("token").setDescription("Approval token (opzionale)").setRequired(false)
     ),
@@ -135,48 +134,51 @@ function chunkText(text, max = 1800) {
   return chunks;
 }
 
+function cleanJsonText(s) {
+  // n8n a volte restituisce: ={"ok":true,...}
+  // oppure: "={...}" oppure whitespace / newline
+  let t = String(s ?? "").trim();
+
+  // rimuovi BOM se presente
+  t = t.replace(/^\uFEFF/, "");
+
+  // rimuovi eventuale leading "="
+  if (t.startsWith("=")) t = t.slice(1).trim();
+
+  // se per qualche motivo resta "= {"
+  if (t.startsWith("{") || t.startsWith("[")) return t;
+
+  // fallback: prova a trovare il primo { o [
+  const iObj = t.indexOf("{");
+  const iArr = t.indexOf("[");
+  const i = (iObj === -1) ? iArr : (iArr === -1 ? iObj : Math.min(iObj, iArr));
+  if (i >= 0) return t.slice(i);
+
+  return t;
+}
+
 function normalizeN8nResponse(payload) {
-  // n8n può tornare:
-  // - oggetto JSON
-  // - stringa JSON (se Respond With = Text + JSON.stringify)
-  // - array con un solo oggetto
   if (payload == null) return null;
 
+  // n8n può restituire direttamente oggetto/array
+  if (typeof payload === "object") {
+    if (Array.isArray(payload)) return payload[0] ?? null;
+    return payload;
+  }
+
+  // oppure stringa (JSON o "=JSON")
   if (typeof payload === "string") {
+    const cleaned = cleanJsonText(payload);
     try {
-      return JSON.parse(payload);
+      const parsed = JSON.parse(cleaned);
+      if (Array.isArray(parsed)) return parsed[0] ?? null;
+      return parsed;
     } catch {
-      // magari è quasi-json o testo: ritorna null e lo gestiamo sopra
       return null;
     }
   }
 
-  if (Array.isArray(payload)) {
-    return payload[0] ?? null;
-  }
-
-  if (typeof payload === "object") return payload;
-
   return null;
-}
-
-async function ensureAllowedChannel(interaction) {
-  // Consenti:
-  // - canale principale allowed
-  // - thread creati dentro quel canale (parentId == allowedChannelId)
-  const isAllowed =
-    interaction.channelId === allowedChannelId ||
-    interaction.channel?.isThread?.() && interaction.channel.parentId === allowedChannelId ||
-    interaction.channel?.parentId === allowedChannelId;
-
-  if (!isAllowed) {
-    await safeReply(interaction, {
-      ephemeral: true,
-      content: `⛔ Usa i comandi solo nel canale <#${allowedChannelId}> (o nei suoi thread).`,
-    });
-    return false;
-  }
-  return true;
 }
 
 async function safeDefer(interaction) {
@@ -186,7 +188,6 @@ async function safeDefer(interaction) {
     }
     return true;
   } catch (e) {
-    // 10062 = Unknown interaction (expired)
     console.error("safeDefer failed:", e?.code || e?.message, e?.rawError || "");
     return false;
   }
@@ -214,6 +215,25 @@ async function safeEdit(interaction, contentOrPayload) {
   }
 }
 
+async function ensureAllowedChannel(interaction) {
+  const ch = interaction.channel;
+
+  const isAllowed =
+    interaction.channelId === allowedChannelId ||
+    (ch?.isThread?.() && ch.parentId === allowedChannelId) ||
+    ch?.parentId === allowedChannelId;
+
+  if (!isAllowed) {
+    await safeReply(interaction, {
+      ephemeral: true,
+      content: `⛔ Usa i comandi solo nel canale <#${allowedChannelId}> (o nei suoi thread).`,
+    });
+    return false;
+  }
+  return true;
+}
+
+// salva mapping thread->token su n8n (se esiste)
 async function linkThreadToToken({
   threadId,
   approvalToken,
@@ -222,7 +242,6 @@ async function linkThreadToToken({
   channelId,
   user,
 }) {
-  // opzionale: se non hai ancora creato l’N8N link-thread workflow, non blocchiamo nulla
   if (!n8nLinkThreadUrl) return;
 
   try {
@@ -236,31 +255,31 @@ async function linkThreadToToken({
         discord_channel_id: channelId || "",
         discord_user: user || "",
       },
-      { timeout: 15_000 }
+      { timeout: 15_000, validateStatus: () => true }
     );
   } catch (e) {
     console.error("linkThreadToToken failed:", e?.response?.status, e?.message);
   }
 }
 
+// se token non passato, prova a recuperarlo dal thread
 async function resolveApprovalToken(interaction, tokenMaybe) {
   const raw = (tokenMaybe || "").trim();
   if (raw) return raw;
 
-  // Se non è un thread e token non fornito → non possiamo indovinare
   const ch = interaction.channel;
   const isThread = !!(ch && typeof ch.isThread === "function" && ch.isThread());
   if (!isThread) return "";
 
   if (!n8nLinkThreadUrl) return "";
 
-  // Recupera token dal workflow link-thread (GET o POST: qui facciamo POST per compatibilità)
   try {
     const resp = await axios.post(
       n8nLinkThreadUrl,
       { thread_id: ch.id },
-      { timeout: 15_000 }
+      { timeout: 15_000, validateStatus: () => true }
     );
+
     const data = normalizeN8nResponse(resp.data);
     if (data?.approval_token) return String(data.approval_token);
   } catch (e) {
@@ -275,7 +294,6 @@ async function resolveApprovalToken(interaction, tokenMaybe) {
  *  ========================= */
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
-
   if (!(await ensureAllowedChannel(interaction))) return;
 
   /** -------- /post -------- */
@@ -292,25 +310,17 @@ client.on("interactionCreate", async (interaction) => {
     const brand = interaction.options.getString("brand") || DEFAULT_BRAND;
 
     try {
-      console.log("➡️ /post received:", {
-        user: interaction.user?.username,
-        channelId: interaction.channelId,
-        attachmentUrl: attachment?.url,
-        proxyUrl: attachment?.proxyURL,
-        filename: attachment?.name,
-      });
-
-      // 1) download attachment
       const downloadUrl = attachment.proxyURL || attachment.url;
+
       const imgResp = await axios.get(downloadUrl, {
         responseType: "arraybuffer",
         timeout: 10_000,
         maxBodyLength: Infinity,
         headers: { "User-Agent": "Mozilla/5.0" },
       });
+
       const imgBuffer = Buffer.from(imgResp.data);
 
-      // 2) multipart to n8n
       const form = new FormData();
       form.append("description", description);
       form.append("language", language);
@@ -327,28 +337,25 @@ client.on("interactionCreate", async (interaction) => {
       });
 
       const n8nResp = await axios.post(n8nDraftUrl, form, {
-        headers: form.getHeaders(),
+        headers: {
+          ...form.getHeaders(),
+          Accept: "application/json,text/plain,*/*",
+        },
         timeout: 90_000,
         maxBodyLength: Infinity,
-        // IMPORTANT: accetta anche risposta text-json
         validateStatus: () => true,
       });
 
-      // 3) normalize response (JSON object OR stringified JSON OR array)
       const rawPayload = n8nResp.data;
       const data = normalizeN8nResponse(rawPayload);
 
       if (!data) {
-        throw new Error(
-          `n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`
-        );
+        throw new Error(`n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`);
       }
-
       if (!data.ok) {
         throw new Error(data.error || "n8n returned ok=false");
       }
 
-      // 4) create thread
       const threadTitle = `Bozza social • ${new Date().toLocaleDateString("it-IT")} • ${interaction.user.username}`;
       const thread = await interaction.channel.threads.create({
         name: threadTitle.slice(0, 95),
@@ -356,7 +363,6 @@ client.on("interactionCreate", async (interaction) => {
         reason: "Auto post social draft",
       });
 
-      // 5) link thread -> token (for /approvato without token)
       await linkThreadToToken({
         threadId: thread.id,
         approvalToken: data.approval_token,
@@ -427,7 +433,7 @@ client.on("interactionCreate", async (interaction) => {
       await safeEdit(
         interaction,
         `❌ Token mancante.\n` +
-          `Usa il comando *nel thread della bozza* (consigliato) oppure passa il token:\n` +
+          `Usa il comando *nel thread della bozza* oppure passa il token:\n` +
           `\`/approvato piattaforma:${platform} token:XXXX\``
       );
       return;
@@ -455,7 +461,6 @@ client.on("interactionCreate", async (interaction) => {
         `✅ Approvazione inviata → **${platform.toUpperCase()}** (token: \`${approvalToken}\`)`
       );
 
-      // conferma nel thread/canale corrente (non ephemeral)
       try {
         await interaction.channel.send(
           `✅ **APPROVATO** → **${platform.toUpperCase()}**\nToken: \`${approvalToken}\``
@@ -507,4 +512,3 @@ http
   .listen(PORT, () => {
     console.log(`🌐 Health server listening on ${PORT}`);
   });
-
