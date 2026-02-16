@@ -29,7 +29,7 @@ const clientId = process.env.DISCORD_CLIENT_ID;
 const n8nDraftUrl = process.env.N8N_DRAFT_WEBHOOK_URL;
 const n8nApproveUrl = process.env.N8N_APPROVE_WEBHOOK_URL;
 
-// OPTIONAL: workflow “link-thread” (thread_id <-> approval_token)
+// Optional: link thread -> token (lookup)
 const n8nLinkThreadUrl = process.env.N8N_LINK_THREAD_WEBHOOK_URL || "";
 
 const allowedChannelId = process.env.ALLOWED_CHANNEL_ID;
@@ -38,6 +38,7 @@ const DEFAULT_LANGUAGE = (process.env.DEFAULT_LANGUAGE || "it").toLowerCase();
 const DEFAULT_TARGET = (process.env.DEFAULT_TARGET || "b2b").toLowerCase();
 const DEFAULT_BRAND = process.env.DEFAULT_BRAND || "idrogrow.com";
 
+// Render Web Service requires a port bind
 const PORT = process.env.PORT || 10000;
 
 function requireEnv(name, value) {
@@ -109,6 +110,7 @@ const commands = [
           { name: "all", value: "all" }
         )
     )
+    // token OPTIONAL (auto-resolve from thread if missing)
     .addStringOption((opt) =>
       opt.setName("token").setDescription("Approval token (opzionale)").setRequired(false)
     ),
@@ -134,51 +136,42 @@ function chunkText(text, max = 1800) {
   return chunks;
 }
 
-function cleanJsonText(s) {
-  // n8n a volte restituisce: ={"ok":true,...}
-  // oppure: "={...}" oppure whitespace / newline
-  let t = String(s ?? "").trim();
-
-  // rimuovi BOM se presente
-  t = t.replace(/^\uFEFF/, "");
-
-  // rimuovi eventuale leading "="
-  if (t.startsWith("=")) t = t.slice(1).trim();
-
-  // se per qualche motivo resta "= {"
-  if (t.startsWith("{") || t.startsWith("[")) return t;
-
-  // fallback: prova a trovare il primo { o [
-  const iObj = t.indexOf("{");
-  const iArr = t.indexOf("[");
-  const i = (iObj === -1) ? iArr : (iArr === -1 ? iObj : Math.min(iObj, iArr));
-  if (i >= 0) return t.slice(i);
-
-  return t;
-}
-
 function normalizeN8nResponse(payload) {
+  // n8n può tornare:
+  // - object JSON
+  // - array [object]
+  // - string JSON
+  // - string JSON con '=' davanti (tipico quando si incolla "={{ ... }}" nel campo)
   if (payload == null) return null;
 
-  // n8n può restituire direttamente oggetto/array
-  if (typeof payload === "object") {
-    if (Array.isArray(payload)) return payload[0] ?? null;
-    return payload;
-  }
+  if (Array.isArray(payload)) return payload[0] ?? null;
 
-  // oppure stringa (JSON o "=JSON")
+  if (typeof payload === "object") return payload;
+
   if (typeof payload === "string") {
-    const cleaned = cleanJsonText(payload);
+    let s = payload.trim();
+
+    // remove leading '=' if present: "={...}"
+    if (s.startsWith("=")) s = s.slice(1).trim();
+
     try {
-      const parsed = JSON.parse(cleaned);
-      if (Array.isArray(parsed)) return parsed[0] ?? null;
-      return parsed;
+      return JSON.parse(s);
     } catch {
       return null;
     }
   }
 
   return null;
+}
+
+async function safeReply(interaction, payload) {
+  try {
+    if (interaction.replied || interaction.deferred) return await interaction.followUp(payload);
+    return await interaction.reply(payload);
+  } catch (e) {
+    console.error("safeReply failed:", e?.code || e?.message);
+    return null;
+  }
 }
 
 async function safeDefer(interaction) {
@@ -190,18 +183,6 @@ async function safeDefer(interaction) {
   } catch (e) {
     console.error("safeDefer failed:", e?.code || e?.message, e?.rawError || "");
     return false;
-  }
-}
-
-async function safeReply(interaction, payload) {
-  try {
-    if (interaction.replied || interaction.deferred) {
-      return await interaction.followUp(payload);
-    }
-    return await interaction.reply(payload);
-  } catch (e) {
-    console.error("safeReply failed:", e?.code || e?.message);
-    return null;
   }
 }
 
@@ -217,10 +198,12 @@ async function safeEdit(interaction, contentOrPayload) {
 
 async function ensureAllowedChannel(interaction) {
   const ch = interaction.channel;
+  const isThread =
+    !!(ch && typeof ch.isThread === "function" && ch.isThread());
 
   const isAllowed =
     interaction.channelId === allowedChannelId ||
-    (ch?.isThread?.() && ch.parentId === allowedChannelId) ||
+    (isThread && ch.parentId === allowedChannelId) ||
     ch?.parentId === allowedChannelId;
 
   if (!isAllowed) {
@@ -233,7 +216,6 @@ async function ensureAllowedChannel(interaction) {
   return true;
 }
 
-// salva mapping thread->token su n8n (se esiste)
 async function linkThreadToToken({
   threadId,
   approvalToken,
@@ -262,18 +244,19 @@ async function linkThreadToToken({
   }
 }
 
-// se token non passato, prova a recuperarlo dal thread
 async function resolveApprovalToken(interaction, tokenMaybe) {
   const raw = (tokenMaybe || "").trim();
   if (raw) return raw;
 
   const ch = interaction.channel;
-  const isThread = !!(ch && typeof ch.isThread === "function" && ch.isThread());
+  const isThread =
+    !!(ch && typeof ch.isThread === "function" && ch.isThread());
   if (!isThread) return "";
 
   if (!n8nLinkThreadUrl) return "";
 
   try {
+    // link-thread workflow: consigliato POST { thread_id }
     const resp = await axios.post(
       n8nLinkThreadUrl,
       { thread_id: ch.id },
@@ -285,7 +268,6 @@ async function resolveApprovalToken(interaction, tokenMaybe) {
   } catch (e) {
     console.error("resolveApprovalToken failed:", e?.response?.status, e?.message);
   }
-
   return "";
 }
 
@@ -304,8 +286,10 @@ client.on("interactionCreate", async (interaction) => {
     const description = interaction.options.getString("descrizione", true);
     const attachment = interaction.options.getAttachment("immagine", true);
 
-    const language = (interaction.options.getString("lingua") || DEFAULT_LANGUAGE).toLowerCase();
-    const target = (interaction.options.getString("target") || DEFAULT_TARGET).toLowerCase();
+    const language =
+      (interaction.options.getString("lingua") || DEFAULT_LANGUAGE).toLowerCase();
+    const target =
+      (interaction.options.getString("target") || DEFAULT_TARGET).toLowerCase();
     const link = interaction.options.getString("link") || "";
     const brand = interaction.options.getString("brand") || DEFAULT_BRAND;
 
@@ -318,7 +302,6 @@ client.on("interactionCreate", async (interaction) => {
         maxBodyLength: Infinity,
         headers: { "User-Agent": "Mozilla/5.0" },
       });
-
       const imgBuffer = Buffer.from(imgResp.data);
 
       const form = new FormData();
@@ -330,33 +313,33 @@ client.on("interactionCreate", async (interaction) => {
       form.append("discord_guild_id", interaction.guildId || "");
       form.append("discord_channel_id", interaction.channelId || "");
       form.append("discord_user", interaction.user?.username || "");
-
       form.append("image", imgBuffer, {
         filename: attachment.name || "image.jpg",
         contentType: attachment.contentType || "image/jpeg",
       });
 
       const n8nResp = await axios.post(n8nDraftUrl, form, {
-        headers: {
-          ...form.getHeaders(),
-          Accept: "application/json,text/plain,*/*",
-        },
+        headers: form.getHeaders(),
         timeout: 90_000,
         maxBodyLength: Infinity,
         validateStatus: () => true,
       });
 
-      const rawPayload = n8nResp.data;
-      const data = normalizeN8nResponse(rawPayload);
+      const data = normalizeN8nResponse(n8nResp.data);
 
       if (!data) {
-        throw new Error(`n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`);
+        throw new Error(
+          `n8n returned non-JSON text: ${String(n8nResp.data).slice(0, 500)}`
+        );
       }
       if (!data.ok) {
         throw new Error(data.error || "n8n returned ok=false");
       }
 
-      const threadTitle = `Bozza social • ${new Date().toLocaleDateString("it-IT")} • ${interaction.user.username}`;
+      const threadTitle = `Bozza social • ${new Date().toLocaleDateString(
+        "it-IT"
+      )} • ${interaction.user.username}`;
+
       const thread = await interaction.channel.threads.create({
         name: threadTitle.slice(0, 95),
         autoArchiveDuration: 1440,
@@ -382,7 +365,7 @@ client.on("interactionCreate", async (interaction) => {
         `- \`/approvato piattaforma:instagram\`\n` +
         `- \`/approvato piattaforma:x\`\n` +
         `- \`/approvato piattaforma:all\`\n` +
-        `\n(Se serve forzare: \`/approvato piattaforma:all token:${data.approval_token}\`)`;
+        `\n(Forza token: \`/approvato piattaforma:all token:${data.approval_token}\`)`;
 
       await thread.send(header);
 
@@ -446,11 +429,12 @@ client.on("interactionCreate", async (interaction) => {
         { timeout: 60_000, validateStatus: () => true }
       );
 
-      const rawPayload = resp.data;
-      const data = normalizeN8nResponse(rawPayload);
+      const data = normalizeN8nResponse(resp.data);
 
       if (!data) {
-        throw new Error(`n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`);
+        throw new Error(
+          `n8n returned non-JSON text: ${String(resp.data).slice(0, 500)}`
+        );
       }
       if (!data.ok) {
         throw new Error(data.error || "n8n returned ok=false");
