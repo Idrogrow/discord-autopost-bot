@@ -29,7 +29,7 @@ const clientId = process.env.DISCORD_CLIENT_ID;
 const n8nDraftUrl = process.env.N8N_DRAFT_WEBHOOK_URL;
 const n8nApproveUrl = process.env.N8N_APPROVE_WEBHOOK_URL;
 
-// Workflow link-thread (thread_id <-> approval_token)
+// Workflow link-thread (thread_id <-> approval_token + metadata)
 const n8nLinkThreadUrl = process.env.N8N_LINK_THREAD_WEBHOOK_URL || "";
 
 const allowedChannelId = process.env.ALLOWED_CHANNEL_ID;
@@ -78,7 +78,10 @@ const commands = [
       opt.setName("descrizione").setDescription("Testo base").setRequired(true)
     )
     .addAttachmentOption((opt) =>
-      opt.setName("immagine").setDescription("Immagine da usare").setRequired(true)
+      opt
+        .setName("immagine")
+        .setDescription("Immagine da usare")
+        .setRequired(true)
     )
     .addStringOption((opt) =>
       opt.setName("lingua").setDescription("it / en").setRequired(false)
@@ -110,9 +113,12 @@ const commands = [
           { name: "all", value: "all" }
         )
     )
-    // token OPTIONAL (auto dal thread)
+    // token OPTIONAL (auto dal thread via link-thread workflow)
     .addStringOption((opt) =>
-      opt.setName("token").setDescription("Approval token (opzionale)").setRequired(false)
+      opt
+        .setName("token")
+        .setDescription("Approval token (opzionale)")
+        .setRequired(false)
     ),
 ].map((c) => c.toJSON());
 
@@ -143,7 +149,6 @@ function tryParseJsonString(s) {
   // n8n a volte manda "=" davanti se il campo non è stato valutato come expression
   if (t.startsWith("=")) t = t.slice(1).trim();
 
-  // se è vuota, stop
   if (!t) return null;
 
   try {
@@ -155,14 +160,13 @@ function tryParseJsonString(s) {
 
 function normalizeN8nResponse(payload) {
   // n8n può tornare:
-  // - oggetto JSON (axios lo parse-a se Content-Type: application/json)
-  // - stringa JSON (se Respond With = Text + JSON.stringify)
+  // - oggetto JSON
+  // - stringa JSON (se Respond With = Text)
   // - array con un solo oggetto
   if (payload == null) return null;
 
   if (typeof payload === "string") {
-    const parsed = tryParseJsonString(payload);
-    return parsed;
+    return tryParseJsonString(payload);
   }
 
   if (Array.isArray(payload)) {
@@ -217,7 +221,8 @@ async function ensureAllowedChannel(interaction) {
   // - thread creati dentro quel canale (parentId == allowedChannelId)
   const isAllowed =
     interaction.channelId === allowedChannelId ||
-    (interaction.channel?.isThread?.() && interaction.channel.parentId === allowedChannelId) ||
+    (interaction.channel?.isThread?.() &&
+      interaction.channel.parentId === allowedChannelId) ||
     interaction.channel?.parentId === allowedChannelId;
 
   if (!isAllowed) {
@@ -230,10 +235,14 @@ async function ensureAllowedChannel(interaction) {
   return true;
 }
 
+/** =========================
+ *  LINK THREAD <-> TOKEN
+ *  ========================= */
 async function linkThreadToToken({
   threadId,
   approvalToken,
   stableMediaUrl,
+  draftMessageId,
   guildId,
   channelId,
   user,
@@ -248,6 +257,7 @@ async function linkThreadToToken({
         thread_id: threadId,
         approval_token: approvalToken,
         stable_media_url: stableMediaUrl || "",
+        draft_message_id: draftMessageId || "",
         discord_guild_id: guildId || "",
         discord_channel_id: channelId || "",
         discord_user: user || "",
@@ -300,12 +310,24 @@ client.on("interactionCreate", async (interaction) => {
     const description = interaction.options.getString("descrizione", true);
     const attachment = interaction.options.getAttachment("immagine", true);
 
-    const language = (interaction.options.getString("lingua") || DEFAULT_LANGUAGE).toLowerCase();
-    const target = (interaction.options.getString("target") || DEFAULT_TARGET).toLowerCase();
+    const language = (
+      interaction.options.getString("lingua") || DEFAULT_LANGUAGE
+    ).toLowerCase();
+    const target = (
+      interaction.options.getString("target") || DEFAULT_TARGET
+    ).toLowerCase();
     const link = interaction.options.getString("link") || "";
     const brand = interaction.options.getString("brand") || DEFAULT_BRAND;
 
     try {
+      console.log("➡️ /post received:", {
+        user: interaction.user?.username,
+        channelId: interaction.channelId,
+        attachmentUrl: attachment?.url,
+        proxyUrl: attachment?.proxyURL,
+        filename: attachment?.name,
+      });
+
       // 1) download attachment
       const downloadUrl = attachment.proxyURL || attachment.url;
 
@@ -345,30 +367,26 @@ client.on("interactionCreate", async (interaction) => {
       const data = normalizeN8nResponse(rawPayload);
 
       if (!data) {
-        throw new Error(`n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`);
+        throw new Error(
+          `n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`
+        );
       }
       if (!data.ok) {
         throw new Error(data.error || "n8n returned ok=false");
       }
 
       // 3) create thread
-      const threadTitle = `Bozza social • ${new Date().toLocaleDateString("it-IT")} • ${interaction.user.username}`;
+      const threadTitle = `Bozza social • ${new Date().toLocaleDateString(
+        "it-IT"
+      )} • ${interaction.user.username}`;
+
       const thread = await interaction.channel.threads.create({
         name: threadTitle.slice(0, 95),
         autoArchiveDuration: 1440,
         reason: "Auto post social draft",
       });
 
-      // 4) link thread -> token (auto-token)
-      await linkThreadToToken({
-        threadId: thread.id,
-        approvalToken: data.approval_token,
-        stableMediaUrl: data.stable_media_url,
-        guildId: interaction.guildId,
-        channelId: interaction.channelId,
-        user: interaction.user?.username,
-      });
-
+      // 4) send header (capture message id)
       const header =
         `🧾 **BOZZA GENERATA (PENDING APPROVAL)**\n` +
         `👤 Richiesta da: **${interaction.user.username}**\n` +
@@ -381,8 +399,20 @@ client.on("interactionCreate", async (interaction) => {
         `- \`/approvato piattaforma:all\`\n` +
         `\n(Se serve forzare: \`/approvato piattaforma:all token:${data.approval_token}\`)`;
 
-      await thread.send(header);
+      const draftMsg = await thread.send(header);
 
+      // 5) link thread -> token (auto-token) + save draft_message_id
+      await linkThreadToToken({
+        threadId: thread.id,
+        approvalToken: data.approval_token,
+        stableMediaUrl: data.stable_media_url,
+        draftMessageId: draftMsg.id,
+        guildId: interaction.guildId,
+        channelId: interaction.channelId,
+        user: interaction.user?.username,
+      });
+
+      // 6) send platform blocks
       const blocks = [
         { title: "INSTAGRAM", body: data.ig_caption },
         { title: "FACEBOOK", body: data.fb_text },
@@ -449,7 +479,9 @@ client.on("interactionCreate", async (interaction) => {
       const data = normalizeN8nResponse(rawPayload);
 
       if (!data) {
-        throw new Error(`n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`);
+        throw new Error(
+          `n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`
+        );
       }
       if (!data.ok) {
         throw new Error(data.error || "n8n returned ok=false");
