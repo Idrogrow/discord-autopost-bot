@@ -59,19 +59,8 @@ console.log("ALLOWED_CHANNEL_ID:", allowedChannelId);
 
 /** =========================
  *  DISCORD CLIENT
- *  =========================
- *  IMPORTANT:
- *  - For token fallback (reading thread messages), enable:
- *    GatewayIntentBits.GuildMessages + GatewayIntentBits.MessageContent
- *  - Also enable "Message Content Intent" in Discord Developer Portal.
- */
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ],
-});
+ *  ========================= */
+const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 client.on("error", (e) => console.error("Discord client error:", e));
 client.on("shardError", (e) => console.error("Discord shard error:", e));
@@ -89,7 +78,10 @@ const commands = [
       opt.setName("descrizione").setDescription("Testo base").setRequired(true)
     )
     .addAttachmentOption((opt) =>
-      opt.setName("immagine").setDescription("Immagine da usare").setRequired(true)
+      opt
+        .setName("immagine")
+        .setDescription("Immagine da usare")
+        .setRequired(true)
     )
     .addStringOption((opt) =>
       opt.setName("lingua").setDescription("it / en").setRequired(false)
@@ -121,7 +113,6 @@ const commands = [
           { name: "all", value: "all" }
         )
     )
-    // token OPTIONAL (auto dal thread)
     .addStringOption((opt) =>
       opt.setName("token").setDescription("Approval token (opzionale)").setRequired(false)
     ),
@@ -150,10 +141,7 @@ function chunkText(text, max = 1800) {
 function tryParseJsonString(s) {
   if (typeof s !== "string") return null;
   let t = s.trim();
-
-  // n8n a volte manda "=" davanti se il campo non è stato valutato come expression
   if (t.startsWith("=")) t = t.slice(1).trim();
-
   if (!t) return null;
 
   try {
@@ -178,7 +166,6 @@ function normalizeN8nResponse(payload) {
   }
 
   if (typeof payload === "object") return payload;
-
   return null;
 }
 
@@ -232,33 +219,18 @@ async function ensureAllowedChannel(interaction) {
   return true;
 }
 
-/** Extract token from thread messages (fallback if n8n "get" fails) */
-async function extractTokenFromThreadMessages(threadChannel) {
-  try {
-    const msgs = await threadChannel.messages.fetch({ limit: 30 });
-    for (const [, m] of msgs) {
-      const txt = String(m.content || "");
-      // Example: "🧩 Token: `xxxx-...`"
-      const match =
-        txt.match(/Token:\s*`?([0-9a-fA-F-]{12,})`?/i) ||
-        txt.match(/approval_token:\s*`?([0-9a-fA-F-]{12,})`?/i);
-      if (match?.[1]) return match[1];
-    }
-  } catch (e) {
-    console.error("extractTokenFromThreadMessages failed:", e?.message);
-  }
-  return "";
-}
-
+/**
+ * Link thread -> approval_token in n8n (persistenza su Google Sheet)
+ * IMPORTANTISSIMO: mandiamo anche draft_message_id
+ */
 async function linkThreadToToken({
-  action = "link",
   threadId,
   approvalToken,
   stableMediaUrl,
-  draftMessageId,
   guildId,
   channelId,
   user,
+  draftMessageId,
 }) {
   if (!n8nLinkThreadUrl) return;
 
@@ -266,14 +238,14 @@ async function linkThreadToToken({
     await axios.post(
       n8nLinkThreadUrl,
       {
-        action,
-        thread_id: threadId,
-        approval_token: approvalToken,
-        stable_media_url: stableMediaUrl || "",
-        draft_message_id: draftMessageId || "",
-        discord_guild_id: guildId || "",
-        discord_channel_id: channelId || "",
-        discord_user: user || "",
+        action: "link",
+        thread_id: String(threadId || ""),
+        approval_token: String(approvalToken || ""),
+        draft_message_id: String(draftMessageId || ""),
+        stable_media_url: String(stableMediaUrl || ""),
+        discord_guild_id: String(guildId || ""),
+        discord_channel_id: String(channelId || ""),
+        discord_user: String(user || ""),
       },
       { timeout: 20_000, validateStatus: () => true }
     );
@@ -290,24 +262,20 @@ async function resolveApprovalToken(interaction, tokenMaybe) {
   const isThread = !!(ch && typeof ch.isThread === "function" && ch.isThread());
   if (!isThread) return "";
 
-  // 1) Try n8n get
-  if (n8nLinkThreadUrl) {
-    try {
-      const resp = await axios.post(
-        n8nLinkThreadUrl,
-        { action: "get", thread_id: ch.id },
-        { timeout: 20_000, validateStatus: () => true }
-      );
-      const data = normalizeN8nResponse(resp.data);
-      if (data?.approval_token) return String(data.approval_token);
-    } catch (e) {
-      console.error("resolveApprovalToken(n8n) failed:", e?.response?.status, e?.message);
-    }
-  }
+  if (!n8nLinkThreadUrl) return "";
 
-  // 2) Fallback: parse thread messages
-  const fromMsgs = await extractTokenFromThreadMessages(ch);
-  if (fromMsgs) return fromMsgs;
+  try {
+    const resp = await axios.post(
+      n8nLinkThreadUrl,
+      { action: "get", thread_id: String(ch.id) },
+      { timeout: 20_000, validateStatus: () => true }
+    );
+
+    const data = normalizeN8nResponse(resp.data);
+    if (data?.approval_token) return String(data.approval_token);
+  } catch (e) {
+    console.error("resolveApprovalToken failed:", e?.response?.status, e?.message);
+  }
 
   return "";
 }
@@ -352,9 +320,9 @@ client.on("interactionCreate", async (interaction) => {
       form.append("target", target);
       form.append("link", link);
       form.append("brand", brand);
-      form.append("discord_guild_id", interaction.guildId || "");
-      form.append("discord_channel_id", interaction.channelId || "");
-      form.append("discord_user", interaction.user?.username || "");
+      form.append("discord_guild_id", String(interaction.guildId || ""));
+      form.append("discord_channel_id", String(interaction.channelId || ""));
+      form.append("discord_user", String(interaction.user?.username || ""));
 
       form.append("image", imgBuffer, {
         filename: attachment.name || "image.jpg",
@@ -386,7 +354,7 @@ client.on("interactionCreate", async (interaction) => {
         reason: "Auto post social draft",
       });
 
-      // 4) send header message first -> we get draft_message_id
+      // 4) send header FIRST (così otteniamo draft_message_id)
       const header =
         `🧾 **BOZZA GENERATA (PENDING APPROVAL)**\n` +
         `👤 Richiesta da: **${interaction.user.username}**\n` +
@@ -400,18 +368,16 @@ client.on("interactionCreate", async (interaction) => {
         `\n(Se serve forzare: \`/approvato piattaforma:all token:${data.approval_token}\`)`;
 
       const headerMsg = await thread.send(header);
-      const draftMessageId = headerMsg?.id ? String(headerMsg.id) : "";
 
-      // 5) link thread -> token in n8n (NOW includes draft_message_id)
+      // 5) link thread -> token (persistenza su sheet) + draft_message_id
       await linkThreadToToken({
-        action: "link",
         threadId: thread.id,
         approvalToken: data.approval_token,
         stableMediaUrl: data.stable_media_url,
-        draftMessageId,
         guildId: interaction.guildId,
         channelId: interaction.channelId,
         user: interaction.user?.username,
+        draftMessageId: headerMsg?.id,
       });
 
       // 6) send platform blocks
@@ -492,7 +458,6 @@ client.on("interactionCreate", async (interaction) => {
         `✅ Approvazione inviata → **${platform.toUpperCase()}** (token: \`${approvalToken}\`)`
       );
 
-      // message in thread/channel (non-ephemeral)
       try {
         await interaction.channel.send(
           `✅ **APPROVATO** → **${platform.toUpperCase()}**\nToken: \`${approvalToken}\``
