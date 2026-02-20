@@ -78,10 +78,7 @@ const commands = [
       opt.setName("descrizione").setDescription("Testo base").setRequired(true)
     )
     .addAttachmentOption((opt) =>
-      opt
-        .setName("immagine")
-        .setDescription("Immagine da usare")
-        .setRequired(true)
+      opt.setName("immagine").setDescription("Immagine da usare").setRequired(true)
     )
     .addStringOption((opt) =>
       opt.setName("lingua").setDescription("it / en").setRequired(false)
@@ -143,7 +140,6 @@ function tryParseJsonString(s) {
   let t = s.trim();
   if (t.startsWith("=")) t = t.slice(1).trim();
   if (!t) return null;
-
   try {
     return JSON.parse(t);
   } catch {
@@ -220,17 +216,17 @@ async function ensureAllowedChannel(interaction) {
 }
 
 /**
- * Link thread -> approval_token in n8n (persistenza su Google Sheet)
- * IMPORTANTISSIMO: mandiamo anche draft_message_id
+ * Link thread -> approval_token (e salva anche draft_message_id)
+ * action "link"
  */
 async function linkThreadToToken({
   threadId,
   approvalToken,
+  draftMessageId,
   stableMediaUrl,
   guildId,
   channelId,
   user,
-  draftMessageId,
 }) {
   if (!n8nLinkThreadUrl) return;
 
@@ -254,6 +250,11 @@ async function linkThreadToToken({
   }
 }
 
+/**
+ * Resolve approval_token from:
+ * - explicit /approvato token:XXXX
+ * - OR thread_id lookup via n8nLinkThreadUrl action "get"
+ */
 async function resolveApprovalToken(interaction, tokenMaybe) {
   const raw = (tokenMaybe || "").trim();
   if (raw) return raw;
@@ -267,7 +268,7 @@ async function resolveApprovalToken(interaction, tokenMaybe) {
   try {
     const resp = await axios.post(
       n8nLinkThreadUrl,
-      { action: "get", thread_id: String(ch.id) },
+      { action: "get", thread_id: ch.id },
       { timeout: 20_000, validateStatus: () => true }
     );
 
@@ -313,16 +314,16 @@ client.on("interactionCreate", async (interaction) => {
 
       const imgBuffer = Buffer.from(imgResp.data);
 
-      // 2) multipart to n8n
+      // 2) multipart to n8n draft
       const form = new FormData();
       form.append("description", description);
       form.append("language", language);
       form.append("target", target);
       form.append("link", link);
       form.append("brand", brand);
-      form.append("discord_guild_id", String(interaction.guildId || ""));
-      form.append("discord_channel_id", String(interaction.channelId || ""));
-      form.append("discord_user", String(interaction.user?.username || ""));
+      form.append("discord_guild_id", interaction.guildId || "");
+      form.append("discord_channel_id", interaction.channelId || "");
+      form.append("discord_user", interaction.user?.username || "");
 
       form.append("image", imgBuffer, {
         filename: attachment.name || "image.jpg",
@@ -354,7 +355,7 @@ client.on("interactionCreate", async (interaction) => {
         reason: "Auto post social draft",
       });
 
-      // 4) send header FIRST (così otteniamo draft_message_id)
+      // 4) send header message and capture message id (draft_message_id)
       const header =
         `🧾 **BOZZA GENERATA (PENDING APPROVAL)**\n` +
         `👤 Richiesta da: **${interaction.user.username}**\n` +
@@ -368,16 +369,17 @@ client.on("interactionCreate", async (interaction) => {
         `\n(Se serve forzare: \`/approvato piattaforma:all token:${data.approval_token}\`)`;
 
       const headerMsg = await thread.send(header);
+      const draftMessageId = headerMsg?.id || "";
 
-      // 5) link thread -> token (persistenza su sheet) + draft_message_id
+      // 5) link thread -> token (auto-token) + save draft_message_id
       await linkThreadToToken({
         threadId: thread.id,
         approvalToken: data.approval_token,
+        draftMessageId,
         stableMediaUrl: data.stable_media_url,
         guildId: interaction.guildId,
         channelId: interaction.channelId,
         user: interaction.user?.username,
-        draftMessageId: headerMsg?.id,
       });
 
       // 6) send platform blocks
