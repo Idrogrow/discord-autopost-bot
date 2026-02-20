@@ -68,14 +68,35 @@ client.on("shardError", (e) => console.error("Discord shard error:", e));
 /** =========================
  *  SLASH COMMANDS
  *  ========================= */
+const platformChoices = [
+  { name: "facebook", value: "facebook" },
+  { name: "instagram", value: "instagram" },
+  { name: "x", value: "x" },
+  { name: "tiktok", value: "tiktok" },
+  { name: "signal", value: "signal" },
+  { name: "all", value: "all" },
+];
+
+const confirmChoices = [
+  { name: "si", value: "si" },
+  { name: "no", value: "no" },
+];
+
 const commands = [
   new SlashCommandBuilder()
     .setName("post")
     .setDescription(
-      "Crea BOZZA multipiattaforma da immagine + descrizione (richiede approvazione)"
+      "Crea BOZZA multipiattaforma da immagine + descrizione + brief (richiede approvazione)"
     )
     .addStringOption((opt) =>
       opt.setName("descrizione").setDescription("Testo base").setRequired(true)
+    )
+    // NUOVO: brief/contesto, passato all'AI
+    .addStringOption((opt) =>
+      opt
+        .setName("descrizione_post")
+        .setDescription("Brief/contesto per personalizzare il post (obiettivo, promo, tono, ecc.)")
+        .setRequired(false)
     )
     .addAttachmentOption((opt) =>
       opt.setName("immagine").setDescription("Immagine da usare").setRequired(true)
@@ -93,22 +114,38 @@ const commands = [
       opt.setName("brand").setDescription("Brand (opzionale)").setRequired(false)
     ),
 
+  // NUOVO: /approva con conferma si/no
   new SlashCommandBuilder()
-    .setName("approvato")
-    .setDescription("Approva e avvia pubblicazione su una piattaforma o su tutte")
+    .setName("approva")
+    .setDescription("Approva e avvia pubblicazione (richiede conferma si/no)")
     .addStringOption((opt) =>
       opt
         .setName("piattaforma")
         .setDescription("facebook / instagram / x / tiktok / signal / all")
         .setRequired(true)
-        .addChoices(
-          { name: "facebook", value: "facebook" },
-          { name: "instagram", value: "instagram" },
-          { name: "x", value: "x" },
-          { name: "tiktok", value: "tiktok" },
-          { name: "signal", value: "signal" },
-          { name: "all", value: "all" }
-        )
+        .addChoices(...platformChoices)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("conferma")
+        .setDescription("Conferma pubblicazione: si / no")
+        .setRequired(true)
+        .addChoices(...confirmChoices)
+    )
+    .addStringOption((opt) =>
+      opt.setName("token").setDescription("Approval token (opzionale)").setRequired(false)
+    ),
+
+  // COMPAT: mantengo anche /approvato
+  new SlashCommandBuilder()
+    .setName("approvato")
+    .setDescription("Compat: Approva e avvia pubblicazione su una piattaforma o su tutte")
+    .addStringOption((opt) =>
+      opt
+        .setName("piattaforma")
+        .setDescription("facebook / instagram / x / tiktok / signal / all")
+        .setRequired(true)
+        .addChoices(...platformChoices)
     )
     .addStringOption((opt) =>
       opt.setName("token").setDescription("Approval token (opzionale)").setRequired(false)
@@ -150,9 +187,7 @@ function tryParseJsonString(s) {
 function normalizeN8nResponse(payload) {
   if (payload == null) return null;
 
-  if (typeof payload === "string") {
-    return tryParseJsonString(payload);
-  }
+  if (typeof payload === "string") return tryParseJsonString(payload);
 
   if (Array.isArray(payload)) {
     const first = payload[0] ?? null;
@@ -252,7 +287,7 @@ async function linkThreadToToken({
 
 /**
  * Resolve approval_token from:
- * - explicit /approvato token:XXXX
+ * - explicit /approva token:XXXX
  * - OR thread_id lookup via n8nLinkThreadUrl action "get"
  */
 async function resolveApprovalToken(interaction, tokenMaybe) {
@@ -273,7 +308,7 @@ async function resolveApprovalToken(interaction, tokenMaybe) {
     );
 
     const data = normalizeN8nResponse(resp.data);
-    if (data?.approval_token) return String(data.approval_token);
+    if (data?.approval_token) return String(data.approval_token).trim();
   } catch (e) {
     console.error("resolveApprovalToken failed:", e?.response?.status, e?.message);
   }
@@ -294,6 +329,7 @@ client.on("interactionCreate", async (interaction) => {
     if (!ok) return;
 
     const description = interaction.options.getString("descrizione", true);
+    const postDescription = interaction.options.getString("descrizione_post", false) || "";
     const attachment = interaction.options.getAttachment("immagine", true);
 
     const language = (interaction.options.getString("lingua") || DEFAULT_LANGUAGE).toLowerCase();
@@ -317,6 +353,7 @@ client.on("interactionCreate", async (interaction) => {
       // 2) multipart to n8n draft
       const form = new FormData();
       form.append("description", description);
+      form.append("post_description", postDescription); // <-- NUOVO campo per AI/prompt
       form.append("language", language);
       form.append("target", target);
       form.append("link", link);
@@ -361,12 +398,14 @@ client.on("interactionCreate", async (interaction) => {
         `👤 Richiesta da: **${interaction.user.username}**\n` +
         `🧩 Token: \`${data.approval_token}\`\n` +
         (data.stable_media_url ? `🖼️ Media: ${data.stable_media_url}\n` : "") +
+        (postDescription ? `📝 Brief: ${postDescription}\n` : "") +
         `\n✅ Per pubblicare (nel thread):\n` +
-        `- \`/approvato piattaforma:facebook\`\n` +
-        `- \`/approvato piattaforma:instagram\`\n` +
-        `- \`/approvato piattaforma:x\`\n` +
-        `- \`/approvato piattaforma:all\`\n` +
-        `\n(Se serve forzare: \`/approvato piattaforma:all token:${data.approval_token}\`)`;
+        `- \`/approva piattaforma:facebook conferma:si\`\n` +
+        `- \`/approva piattaforma:instagram conferma:si\`\n` +
+        `- \`/approva piattaforma:x conferma:si\`\n` +
+        `- \`/approva piattaforma:all conferma:si\`\n` +
+        `\n❌ Per annullare:\n` +
+        `- \`/approva piattaforma:all conferma:no\``;
 
       const headerMsg = await thread.send(header);
       const draftMessageId = headerMsg?.id || "";
@@ -418,13 +457,24 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
-  /** -------- /approvato -------- */
-  if (interaction.commandName === "approvato") {
+  /** -------- /approva + /approvato -------- */
+  if (interaction.commandName === "approva" || interaction.commandName === "approvato") {
     const ok = await safeDefer(interaction);
     if (!ok) return;
 
     const platform = interaction.options.getString("piattaforma", true);
     const tokenOpt = interaction.options.getString("token", false);
+
+    // conferma: per /approvato non esiste -> assumo "si"
+    const conferma =
+      interaction.commandName === "approva"
+        ? interaction.options.getString("conferma", true)
+        : "si";
+
+    if (String(conferma).toLowerCase() === "no") {
+      await safeEdit(interaction, `🚫 Operazione annullata. Nessuna pubblicazione avviata.`);
+      return;
+    }
 
     const approvalToken = await resolveApprovalToken(interaction, tokenOpt);
 
@@ -433,7 +483,7 @@ client.on("interactionCreate", async (interaction) => {
         interaction,
         `❌ Token mancante.\n` +
           `Usa il comando *nel thread della bozza* (consigliato) oppure passa il token:\n` +
-          `\`/approvato piattaforma:${platform} token:XXXX\``
+          `\`/approva piattaforma:${platform} conferma:si token:XXXX\``
       );
       return;
     }
@@ -472,7 +522,7 @@ client.on("interactionCreate", async (interaction) => {
       const respData = err?.response?.data;
       const msg = err?.message;
 
-      console.error("❌ /approvato failed:", { status, respData, msg });
+      console.error("❌ approve failed:", { status, respData, msg });
 
       await safeEdit(
         interaction,
