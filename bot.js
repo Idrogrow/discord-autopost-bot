@@ -88,18 +88,19 @@ const commands = [
     .setDescription(
       "Crea BOZZA multipiattaforma da immagine + descrizione + brief (richiede approvazione)"
     )
+    // ✅ REQUIRED OPTIONS MUST COME FIRST
     .addStringOption((opt) =>
       opt.setName("descrizione").setDescription("Testo base").setRequired(true)
     )
-    // NUOVO: brief/contesto, passato all'AI
+    .addAttachmentOption((opt) =>
+      opt.setName("immagine").setDescription("Immagine da usare").setRequired(true)
+    )
+    // ❌ OPTIONAL OPTIONS AFTER REQUIRED
     .addStringOption((opt) =>
       opt
         .setName("descrizione_post")
         .setDescription("Brief/contesto per personalizzare il post (obiettivo, promo, tono, ecc.)")
         .setRequired(false)
-    )
-    .addAttachmentOption((opt) =>
-      opt.setName("immagine").setDescription("Immagine da usare").setRequired(true)
     )
     .addStringOption((opt) =>
       opt.setName("lingua").setDescription("it / en").setRequired(false)
@@ -114,7 +115,6 @@ const commands = [
       opt.setName("brand").setDescription("Brand (opzionale)").setRequired(false)
     ),
 
-  // NUOVO: /approva con conferma si/no
   new SlashCommandBuilder()
     .setName("approva")
     .setDescription("Approva e avvia pubblicazione (richiede conferma si/no)")
@@ -136,7 +136,7 @@ const commands = [
       opt.setName("token").setDescription("Approval token (opzionale)").setRequired(false)
     ),
 
-  // COMPAT: mantengo anche /approvato
+  // Compat
   new SlashCommandBuilder()
     .setName("approvato")
     .setDescription("Compat: Approva e avvia pubblicazione su una piattaforma o su tutte")
@@ -250,10 +250,6 @@ async function ensureAllowedChannel(interaction) {
   return true;
 }
 
-/**
- * Link thread -> approval_token (e salva anche draft_message_id)
- * action "link"
- */
 async function linkThreadToToken({
   threadId,
   approvalToken,
@@ -285,11 +281,6 @@ async function linkThreadToToken({
   }
 }
 
-/**
- * Resolve approval_token from:
- * - explicit /approva token:XXXX
- * - OR thread_id lookup via n8nLinkThreadUrl action "get"
- */
 async function resolveApprovalToken(interaction, tokenMaybe) {
   const raw = (tokenMaybe || "").trim();
   if (raw) return raw;
@@ -338,7 +329,6 @@ client.on("interactionCreate", async (interaction) => {
     const brand = interaction.options.getString("brand") || DEFAULT_BRAND;
 
     try {
-      // 1) download attachment
       const downloadUrl = attachment.proxyURL || attachment.url;
 
       const imgResp = await axios.get(downloadUrl, {
@@ -350,10 +340,9 @@ client.on("interactionCreate", async (interaction) => {
 
       const imgBuffer = Buffer.from(imgResp.data);
 
-      // 2) multipart to n8n draft
       const form = new FormData();
       form.append("description", description);
-      form.append("post_description", postDescription); // <-- NUOVO campo per AI/prompt
+      form.append("post_description", postDescription);
       form.append("language", language);
       form.append("target", target);
       form.append("link", link);
@@ -377,14 +366,9 @@ client.on("interactionCreate", async (interaction) => {
       const rawPayload = n8nResp.data;
       const data = normalizeN8nResponse(rawPayload);
 
-      if (!data) {
-        throw new Error(`n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`);
-      }
-      if (!data.ok) {
-        throw new Error(data.error || "n8n returned ok=false");
-      }
+      if (!data) throw new Error(`n8n non-JSON: ${String(rawPayload).slice(0, 500)}`);
+      if (!data.ok) throw new Error(data.error || "n8n returned ok=false");
 
-      // 3) create thread
       const threadTitle = `Bozza social • ${new Date().toLocaleDateString("it-IT")} • ${interaction.user.username}`;
       const thread = await interaction.channel.threads.create({
         name: threadTitle.slice(0, 95),
@@ -392,7 +376,6 @@ client.on("interactionCreate", async (interaction) => {
         reason: "Auto post social draft",
       });
 
-      // 4) send header message and capture message id (draft_message_id)
       const header =
         `🧾 **BOZZA GENERATA (PENDING APPROVAL)**\n` +
         `👤 Richiesta da: **${interaction.user.username}**\n` +
@@ -410,7 +393,6 @@ client.on("interactionCreate", async (interaction) => {
       const headerMsg = await thread.send(header);
       const draftMessageId = headerMsg?.id || "";
 
-      // 5) link thread -> token (auto-token) + save draft_message_id
       await linkThreadToToken({
         threadId: thread.id,
         approvalToken: data.approval_token,
@@ -421,7 +403,6 @@ client.on("interactionCreate", async (interaction) => {
         user: interaction.user?.username,
       });
 
-      // 6) send platform blocks
       const blocks = [
         { title: "INSTAGRAM", body: data.ig_caption },
         { title: "FACEBOOK", body: data.fb_text },
@@ -432,9 +413,7 @@ client.on("interactionCreate", async (interaction) => {
 
       for (const b of blocks) {
         const txt = `**${b.title}**\n${b.body || "(vuoto)"}`;
-        for (const part of chunkText(txt)) {
-          await thread.send(part);
-        }
+        for (const part of chunkText(txt)) await thread.send(part);
       }
 
       await safeEdit(interaction, `✅ Bozza creata nel thread: <#${thread.id}>`);
@@ -448,10 +427,9 @@ client.on("interactionCreate", async (interaction) => {
 
       await safeEdit(
         interaction,
-        `❌ Errore generazione bozza.\n` +
-          `status: ${status ?? "n/a"}\n` +
-          `msg: ${msg ?? "n/a"}\n` +
-          `data: ${respData ? String(respData).slice(0, 800) : "n/a"}`
+        `❌ Errore bozza.\nstatus: ${status ?? "n/a"}\nmsg: ${msg ?? "n/a"}\ndata: ${
+          respData ? String(respData).slice(0, 800) : "n/a"
+        }`
       );
       return;
     }
@@ -464,8 +442,6 @@ client.on("interactionCreate", async (interaction) => {
 
     const platform = interaction.options.getString("piattaforma", true);
     const tokenOpt = interaction.options.getString("token", false);
-
-    // conferma: per /approvato non esiste -> assumo "si"
     const conferma =
       interaction.commandName === "approva"
         ? interaction.options.getString("conferma", true)
@@ -481,8 +457,7 @@ client.on("interactionCreate", async (interaction) => {
     if (!approvalToken) {
       await safeEdit(
         interaction,
-        `❌ Token mancante.\n` +
-          `Usa il comando *nel thread della bozza* (consigliato) oppure passa il token:\n` +
+        `❌ Token mancante.\nUsa il comando nel thread oppure:\n` +
           `\`/approva piattaforma:${platform} conferma:si token:XXXX\``
       );
       return;
@@ -498,12 +473,8 @@ client.on("interactionCreate", async (interaction) => {
       const rawPayload = resp.data;
       const data = normalizeN8nResponse(rawPayload);
 
-      if (!data) {
-        throw new Error(`n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`);
-      }
-      if (!data.ok) {
-        throw new Error(data.error || "n8n returned ok=false");
-      }
+      if (!data) throw new Error(`n8n non-JSON: ${String(rawPayload).slice(0, 500)}`);
+      if (!data.ok) throw new Error(data.error || "n8n returned ok=false");
 
       await safeEdit(
         interaction,
@@ -526,10 +497,9 @@ client.on("interactionCreate", async (interaction) => {
 
       await safeEdit(
         interaction,
-        `❌ Errore approvazione.\n` +
-          `status: ${status ?? "n/a"}\n` +
-          `msg: ${msg ?? "n/a"}\n` +
-          `data: ${respData ? String(respData).slice(0, 800) : "n/a"}`
+        `❌ Errore approvazione.\nstatus: ${status ?? "n/a"}\nmsg: ${msg ?? "n/a"}\ndata: ${
+          respData ? String(respData).slice(0, 800) : "n/a"
+        }`
       );
     }
   }
