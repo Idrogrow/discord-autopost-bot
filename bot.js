@@ -39,7 +39,16 @@ const DEFAULT_TARGET = (process.env.DEFAULT_TARGET || "b2b").toLowerCase();
 const DEFAULT_BRAND = process.env.DEFAULT_BRAND || "idrogrow.com";
 
 // Render Web Service requires a port bind
+import http from "http";
+
 const PORT = process.env.PORT || 10000;
+
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OK");
+}).listen(PORT, () => {
+  console.log(`Health server listening on ${PORT}`);
+});
 
 function requireEnv(name, value) {
   if (!value) throw new Error(`Missing env var: ${name}`);
@@ -531,3 +540,4 @@ http
   .listen(PORT, () => {
     console.log(`🌐 Health server listening on ${PORT}`);
   });
+
