@@ -1,48 +1,73 @@
 /**
- * Idrogrow Discord AutoPost Bot
- * - /post: crea bozza (manda immagine + dati a n8n draft webhook)
- * - /approvato: approva pubblicazione (manda token + piattaforma a n8n approve webhook)
- * - Link thread <-> token via n8n link-thread webhook (action link/get)
- *
- * IMPORTANT (Render):
- * - avviamo subito un server HTTP su PORT per evitare "no open ports detected".
+ * Discord AutoPost Bot (Render-ready)
+ * - ESM module
+ * - Health server on PORT (Render needs a bound port for Web Service)
+ * - Robust token env: DISCORD_BOT_TOKEN || DISCORD_TOKEN
+ * - Commands:
+ *    /post (image required) + descrizione_post (optional)
+ *    /approvato piattaforma conferma token(optional)
  */
 
 import "dotenv/config";
-import http from "http";
+import http from "node:http";
 import axios from "axios";
 import FormData from "form-data";
-
 import {
   Client,
   GatewayIntentBits,
   Partials,
+  REST,
+  Routes,
   SlashCommandBuilder,
 } from "discord.js";
-import { REST } from "@discordjs/rest";
-import { Routes } from "discord-api-types/v10";
 
-/** =========================
- *  ENV
+/* =========================
+ *  ENV / CONSTANTS
  *  ========================= */
-const token = process.env.DISCORD_TOKEN;
-const clientId = process.env.DISCORD_CLIENT_ID;
+const requireEnv = (name, value) => {
+  if (!value) throw new Error(`Missing required env var: ${name}`);
+  return value;
+};
 
-const n8nDraftUrl = process.env.N8N_DRAFT_WEBHOOK_URL || "";
-const n8nApproveUrl = process.env.N8N_APPROVE_WEBHOOK_URL || "";
-const n8nLinkThreadUrl = process.env.N8N_LINK_THREAD_WEBHOOK_URL || "";
+const DISCORD_TOKEN_RAW =
+  (process.env.DISCORD_BOT_TOKEN || process.env.DISCORD_TOKEN || "").trim();
+const DISCORD_APP_ID = (process.env.DISCORD_APP_ID || "").trim();
 
-const allowedChannelId = process.env.ALLOWED_CHANNEL_ID || ""; // canale dove ascoltare
+const N8N_DRAFT_WEBHOOK_URL = (process.env.N8N_DRAFT_WEBHOOK_URL || "").trim();
+const N8N_APPROVE_WEBHOOK_URL = (process.env.N8N_APPROVE_WEBHOOK_URL || "").trim();
+const N8N_LINK_THREAD_WEBHOOK_URL = (process.env.N8N_LINK_THREAD_WEBHOOK_URL || "").trim();
+
+const ALLOWED_CHANNEL_ID = (process.env.ALLOWED_CHANNEL_ID || "").trim();
+
+// Defaults
+const DEFAULT_BRAND = (process.env.DEFAULT_BRAND || "idrogrow.com").trim();
+const DEFAULT_LANGUAGE = (process.env.DEFAULT_LANGUAGE || "it").trim();
+const DEFAULT_TARGET = (process.env.DEFAULT_TARGET || "b2b").trim();
+
+requireEnv("DISCORD_BOT_TOKEN or DISCORD_TOKEN", DISCORD_TOKEN_RAW);
+requireEnv("DISCORD_APP_ID", DISCORD_APP_ID);
+requireEnv("N8N_DRAFT_WEBHOOK_URL", N8N_DRAFT_WEBHOOK_URL);
+requireEnv("N8N_APPROVE_WEBHOOK_URL", N8N_APPROVE_WEBHOOK_URL);
+requireEnv("N8N_LINK_THREAD_WEBHOOK_URL", N8N_LINK_THREAD_WEBHOOK_URL);
+requireEnv("ALLOWED_CHANNEL_ID", ALLOWED_CHANNEL_ID);
+
+const mask = (s) => {
+  const v = String(s || "");
+  if (v.length <= 10) return "***";
+  return `${v.slice(0, 4)}…${v.slice(-4)}`;
+};
+
+console.log("✅ Booting Discord AutoPost Bot");
+console.log("N8N_DRAFT_WEBHOOK_URL:", N8N_DRAFT_WEBHOOK_URL);
+console.log("N8N_APPROVE_WEBHOOK_URL:", N8N_APPROVE_WEBHOOK_URL);
+console.log("N8N_LINK_THREAD_WEBHOOK_URL:", N8N_LINK_THREAD_WEBHOOK_URL);
+console.log("ALLOWED_CHANNEL_ID:", ALLOWED_CHANNEL_ID);
+console.log("DISCORD_TOKEN (masked):", mask(DISCORD_TOKEN_RAW));
+
+/* =========================
+ *  HEALTH SERVER (Render)
+ *  ========================= */
 const PORT = Number(process.env.PORT || 10000);
-
-const DEFAULT_LANGUAGE = "it";
-const DEFAULT_TARGET = "b2b";
-const DEFAULT_BRAND = "idrogrow.com";
-
-/** =========================
- *  RENDER HEALTH SERVER
- *  (AVVIALO SUBITO)
- *  ========================= */
 http
   .createServer((req, res) => {
     if (req.url === "/health") {
@@ -51,83 +76,37 @@ http
       return;
     }
     res.writeHead(200, { "Content-Type": "text/plain" });
-    res.end("Idrogrow Discord bot running");
+    res.end("running");
   })
-  .listen(PORT, "0.0.0.0", () => {
-    console.log(`🌐 Health server listening on ${PORT}`);
-  });
+  .listen(PORT, () => console.log(`🌐 Health server listening on ${PORT}`));
 
-/** =========================
- *  BASIC VALIDATION
- *  ========================= */
-if (!token) console.warn("⚠️ Missing DISCORD_TOKEN");
-if (!clientId) console.warn("⚠️ Missing DISCORD_CLIENT_ID");
-
-console.log("✅ Booting Discord AutoPost Bot");
-console.log("N8N_DRAFT_WEBHOOK_URL:", n8nDraftUrl);
-console.log("N8N_APPROVE_WEBHOOK_URL:", n8nApproveUrl);
-console.log("N8N_LINK_THREAD_WEBHOOK_URL:", n8nLinkThreadUrl);
-console.log("ALLOWED_CHANNEL_ID:", allowedChannelId);
-
-/** =========================
+/* =========================
  *  DISCORD CLIENT
  *  ========================= */
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // utile per fallback token leggendo header
-  ],
-  partials: [Partials.Channel, Partials.Message],
+  intents: [GatewayIntentBits.Guilds],
+  partials: [Partials.Channel],
 });
 
-/** =========================
+/* =========================
  *  HELPERS
  *  ========================= */
-function chunkText(text, maxLen = 1800) {
-  const s = String(text ?? "");
-  if (s.length <= maxLen) return [s];
-  const out = [];
-  let i = 0;
-  while (i < s.length) {
-    out.push(s.slice(i, i + maxLen));
-    i += maxLen;
-  }
-  return out;
-}
-
-function normalizeN8nResponse(payload) {
-  // n8n può ritornare oggetto, stringa JSON, o array con 1 item
-  if (!payload) return null;
-
-  if (typeof payload === "string") {
-    try {
-      return JSON.parse(payload);
-    } catch {
-      return null;
-    }
-  }
-
-  if (Array.isArray(payload)) {
-    // tipico: [{ json: {...}}] o [{...}]
-    const first = payload[0];
+const normalizeN8nResponse = (data) => {
+  // n8n can return object OR [{json:{...}}] OR [{...}]
+  if (!data) return null;
+  if (Array.isArray(data)) {
+    const first = data[0];
     if (!first) return null;
-    if (first.json && typeof first.json === "object") return first.json;
-    if (typeof first === "object") return first;
+    return first.json ? first.json : first;
   }
-
-  if (typeof payload === "object") {
-    if (payload.json && typeof payload.json === "object") return payload.json;
-    return payload;
-  }
-
-  return null;
-}
+  return data;
+};
 
 async function safeDefer(interaction) {
   try {
-    if (interaction.deferred || interaction.replied) return true;
-    await interaction.deferReply({ ephemeral: true });
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ ephemeral: true });
+    }
     return true;
   } catch (e) {
     console.error("safeDefer failed:", e?.message);
@@ -135,153 +114,50 @@ async function safeDefer(interaction) {
   }
 }
 
-async function safeEdit(interaction, content) {
+async function safeReply(interaction, payload) {
   try {
     if (interaction.replied || interaction.deferred) {
-      await interaction.editReply(content);
-    } else {
-      await interaction.reply({ content, ephemeral: true });
+      return await interaction.followUp(payload);
     }
+    return await interaction.reply(payload);
+  } catch (e) {
+    console.error("safeReply failed:", e?.message);
+    return null;
+  }
+}
+
+async function safeEdit(interaction, payload) {
+  try {
+    if (!interaction.deferred && !interaction.replied) return null;
+    return await interaction.editReply(payload);
   } catch (e) {
     console.error("safeEdit failed:", e?.message);
+    return null;
   }
 }
 
 async function ensureAllowedChannel(interaction) {
-  if (!allowedChannelId) return true; // se non settato, non bloccare
-  try {
-    const ch = interaction.channel;
-    const isThread = !!(ch && typeof ch.isThread === "function" && ch.isThread());
-    const parentId = isThread ? ch.parentId : ch.id;
+  const allowed = ALLOWED_CHANNEL_ID;
 
-    if (String(parentId) !== String(allowedChannelId)) {
-      await interaction.reply({
-        content: "⛔ Questo comando è abilitato solo nel canale autorizzato.",
-        ephemeral: true,
-      });
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.error("ensureAllowedChannel failed:", e?.message);
-    return true;
+  const isAllowed =
+    interaction.channelId === allowed ||
+    (interaction.channel?.isThread?.() && interaction.channel.parentId === allowed) ||
+    interaction.channel?.parentId === allowed;
+
+  if (!isAllowed) {
+    await safeReply(interaction, {
+      ephemeral: true,
+      content: `⛔ Usa i comandi solo nel canale <#${allowed}> (o nei suoi thread).`,
+    });
+    return false;
   }
+  return true;
 }
 
-/** =========================
- *  SLASH COMMANDS
- *  (Required options MUST come first)
- *  ========================= */
-const commands = [
-  new SlashCommandBuilder()
-    .setName("post")
-    .setDescription("Crea una bozza social (con immagine) e la invia al workflow n8n")
-    // REQUIRED (devono stare prima)
-    .addStringOption((o) =>
-      o
-        .setName("descrizione")
-        .setDescription("Testo base / brief generale")
-        .setRequired(true)
-    )
-    .addAttachmentOption((o) =>
-      o
-        .setName("immagine")
-        .setDescription("Immagine del post")
-        .setRequired(true)
-    )
-    // OPTIONAL (dopo i required)
-    .addStringOption((o) =>
-      o
-        .setName("descrizione_post")
-        .setDescription("Descrizione/obiettivo per personalizzare il post (opzionale)")
-        .setRequired(false)
-    )
-    .addStringOption((o) =>
-      o
-        .setName("lingua")
-        .setDescription("Lingua (it/en)")
-        .setRequired(false)
-        .addChoices(
-          { name: "Italiano", value: "it" },
-          { name: "English", value: "en" }
-        )
-    )
-    .addStringOption((o) =>
-      o
-        .setName("target")
-        .setDescription("Target (b2b/b2c)")
-        .setRequired(false)
-        .addChoices(
-          { name: "B2B", value: "b2b" },
-          { name: "B2C", value: "b2c" }
-        )
-    )
-    .addStringOption((o) =>
-      o
-        .setName("link")
-        .setDescription("Link da includere (opzionale)")
-        .setRequired(false)
-    )
-    .addStringOption((o) =>
-      o
-        .setName("brand")
-        .setDescription("Brand/sito (default idrogrow.com)")
-        .setRequired(false)
-    ),
-
-  new SlashCommandBuilder()
-    .setName("approvato")
-    .setDescription("Approva (o annulla) la pubblicazione della bozza")
-    // REQUIRED (prima)
-    .addStringOption((o) =>
-      o
-        .setName("piattaforma")
-        .setDescription("Dove pubblicare")
-        .setRequired(true)
-        .addChoices(
-          { name: "Facebook", value: "facebook" },
-          { name: "Instagram", value: "instagram" },
-          { name: "X", value: "x" },
-          { name: "TikTok", value: "tiktok" },
-          { name: "Signal", value: "signal" },
-          { name: "Tutte", value: "all" }
-        )
-    )
-    .addStringOption((o) =>
-      o
-        .setName("conferma")
-        .setDescription("Conferma pubblicazione? (si/no)")
-        .setRequired(true)
-        .addChoices(
-          { name: "SI", value: "si" },
-          { name: "NO", value: "no" }
-        )
-    )
-    // OPTIONAL (dopo)
-    .addStringOption((o) =>
-      o
-        .setName("token")
-        .setDescription("Approval token (opzionale, se sei nel thread lo recupera da solo)")
-        .setRequired(false)
-    ),
-].map((c) => c.toJSON());
-
-async function registerCommands() {
-  if (!token || !clientId) return;
-
-  const rest = new REST({ version: "10" }).setToken(token);
-  try {
-    await rest.put(Routes.applicationCommands(clientId), { body: commands });
-    console.log("✅ Slash commands registered");
-  } catch (e) {
-    console.error("❌ registerCommands failed:", e?.message, e?.rawError);
-    throw e;
-  }
-}
-
-/** =========================
- *  LINK THREAD <-> TOKEN
- *  ========================= */
+/**
+ * Link thread -> approval_token (e salva draft_message_id)
+ * n8n link-thread webhook: action "link"
+ */
 async function linkThreadToToken({
   threadId,
   approvalToken,
@@ -291,11 +167,9 @@ async function linkThreadToToken({
   channelId,
   user,
 }) {
-  if (!n8nLinkThreadUrl) return;
-
   try {
     await axios.post(
-      n8nLinkThreadUrl,
+      N8N_LINK_THREAD_WEBHOOK_URL,
       {
         action: "link",
         thread_id: String(threadId || ""),
@@ -306,7 +180,7 @@ async function linkThreadToToken({
         discord_channel_id: String(channelId || ""),
         discord_user: String(user || ""),
       },
-      { timeout: 20_000, validateStatus: () => true }
+      { timeout: 20000, validateStatus: () => true }
     );
   } catch (e) {
     console.error("linkThreadToToken failed:", e?.response?.status, e?.message);
@@ -314,104 +188,170 @@ async function linkThreadToToken({
 }
 
 /**
- * Fallback: prova a leggere il token dal messaggio header nel thread
- * (quello che contiene: 🧩 Token: `xxxx`)
- */
-async function fallbackTokenFromThreadHeader(interaction) {
-  try {
-    const ch = interaction.channel;
-    const isThread = !!(ch && typeof ch.isThread === "function" && ch.isThread());
-    if (!isThread) return "";
-
-    // fetch ultimi 50 messaggi
-    const msgs = await ch.messages.fetch({ limit: 50 });
-    for (const [, m] of msgs) {
-      const txt = m?.content || "";
-      const match = txt.match(/Token:\s*`([^`]+)`/i);
-      if (match?.[1]) return match[1].trim();
-    }
-    return "";
-  } catch (e) {
-    console.error("fallbackTokenFromThreadHeader failed:", e?.message);
-    return "";
-  }
-}
-
-/**
- * Resolve approval_token from:
- * - explicit /approvato token:XXXX
- * - OR thread_id lookup via n8nLinkThreadUrl action "get"
- * - OR fallback parse from thread header message
+ * Resolve approval_token:
+ * - explicit token option
+ * - else lookup by thread_id via link-thread webhook action "get"
  */
 async function resolveApprovalToken(interaction, tokenMaybe) {
-  const raw = (tokenMaybe || "").trim();
-  if (raw) return raw;
+  const direct = String(tokenMaybe || "").trim();
+  if (direct) return direct;
 
   const ch = interaction.channel;
   const isThread = !!(ch && typeof ch.isThread === "function" && ch.isThread());
   if (!isThread) return "";
 
-  // 1) prova via n8n get
-  if (n8nLinkThreadUrl) {
-    try {
-      const resp = await axios.post(
-        n8nLinkThreadUrl,
-        { action: "get", thread_id: ch.id },
-        { timeout: 20_000, validateStatus: () => true }
-      );
-
-      const data = normalizeN8nResponse(resp.data);
-      if (data?.approval_token) return String(data.approval_token).trim();
-    } catch (e) {
-      console.error("resolveApprovalToken(n8n get) failed:", e?.response?.status, e?.message);
-    }
+  try {
+    const resp = await axios.post(
+      N8N_LINK_THREAD_WEBHOOK_URL,
+      { action: "get", thread_id: ch.id },
+      { timeout: 20000, validateStatus: () => true }
+    );
+    const data = normalizeN8nResponse(resp.data);
+    return data?.approval_token ? String(data.approval_token) : "";
+  } catch (e) {
+    console.error("resolveApprovalToken failed:", e?.response?.status, e?.message);
+    return "";
   }
-
-  // 2) fallback: leggi dal messaggio header del thread
-  const tok2 = await fallbackTokenFromThreadHeader(interaction);
-  if (tok2) return tok2;
-
-  return "";
 }
 
-/** =========================
+/* =========================
+ *  SLASH COMMANDS (IMPORTANT: required options FIRST)
+ *  ========================= */
+const commands = [
+  new SlashCommandBuilder()
+    .setName("post")
+    .setDescription("Crea una bozza social (testo + immagine) via n8n/AI")
+    // REQUIRED (must be before optional)
+    .addStringOption((opt) =>
+      opt
+        .setName("descrizione")
+        .setDescription("Descrizione base del post (contesto/brief)")
+        .setRequired(true)
+    )
+    .addAttachmentOption((opt) =>
+      opt
+        .setName("immagine")
+        .setDescription("Immagine del post")
+        .setRequired(true)
+    )
+    // OPTIONAL (after required)
+    .addStringOption((opt) =>
+      opt
+        .setName("descrizione_post")
+        .setDescription("Extra: dettagli/obiettivo del post (per personalizzare l'AI)")
+        .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("lingua")
+        .setDescription("Lingua output")
+        .addChoices(
+          { name: "Italiano", value: "it" },
+          { name: "English", value: "en" }
+        )
+        .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("target")
+        .setDescription("Target")
+        .addChoices({ name: "B2B", value: "b2b" }, { name: "B2C", value: "b2c" })
+        .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("brand")
+        .setDescription("Brand / sito (es. idrogrow.com)")
+        .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("link")
+        .setDescription("Link da includere (opzionale)")
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("approvato")
+    .setDescription("Approva la bozza e (se confermi) avvia il posting")
+    // REQUIRED FIRST
+    .addStringOption((opt) =>
+      opt
+        .setName("piattaforma")
+        .setDescription("Dove postare")
+        .setRequired(true)
+        .addChoices(
+          { name: "facebook", value: "facebook" },
+          { name: "instagram", value: "instagram" },
+          { name: "x", value: "x" },
+          { name: "tiktok", value: "tiktok" },
+          { name: "signal", value: "signal" },
+          { name: "tutte", value: "all" }
+        )
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("conferma")
+        .setDescription("Confermi il posting?")
+        .setRequired(true)
+        .addChoices({ name: "si", value: "si" }, { name: "no", value: "no" })
+    )
+    // OPTIONAL last
+    .addStringOption((opt) =>
+      opt
+        .setName("token")
+        .setDescription("Approval token (opzionale, se non sei nel thread)")
+        .setRequired(false)
+    ),
+].map((c) => c.toJSON());
+
+async function registerCommands() {
+  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN_RAW);
+  await rest.put(Routes.applicationCommands(DISCORD_APP_ID), { body: commands });
+  console.log("✅ Slash commands registered");
+}
+
+/* =========================
  *  MAIN HANDLER
  *  ========================= */
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (!(await ensureAllowedChannel(interaction))) return;
 
-  /** -------- /post -------- */
+  /* -------- /post -------- */
   if (interaction.commandName === "post") {
     const ok = await safeDefer(interaction);
     if (!ok) return;
 
     const description = interaction.options.getString("descrizione", true);
-    const postDescription = interaction.options.getString("descrizione_post", false) || "";
+    const postDescription = interaction.options.getString("descrizione_post") || "";
     const attachment = interaction.options.getAttachment("immagine", true);
 
-    const language = (interaction.options.getString("lingua") || DEFAULT_LANGUAGE).toLowerCase();
-    const target = (interaction.options.getString("target") || DEFAULT_TARGET).toLowerCase();
-    const link = interaction.options.getString("link") || "";
-    const brand = interaction.options.getString("brand") || DEFAULT_BRAND;
+    const language = (interaction.options.getString("lingua") || DEFAULT_LANGUAGE)
+      .trim()
+      .toLowerCase();
+    const target = (interaction.options.getString("target") || DEFAULT_TARGET)
+      .trim()
+      .toLowerCase();
+    const link = (interaction.options.getString("link") || "").trim();
+    const brand = (interaction.options.getString("brand") || DEFAULT_BRAND).trim();
 
     try {
-      // 1) download attachment
+      // Download image
       const downloadUrl = attachment.proxyURL || attachment.url;
-
       const imgResp = await axios.get(downloadUrl, {
         responseType: "arraybuffer",
-        timeout: 15_000,
+        timeout: 15000,
         maxBodyLength: Infinity,
         headers: { "User-Agent": "Mozilla/5.0" },
       });
 
       const imgBuffer = Buffer.from(imgResp.data);
 
-      // 2) multipart to n8n draft
+      // Multipart -> n8n draft
       const form = new FormData();
       form.append("description", description);
-      form.append("post_description", postDescription); // NUOVO CAMPO
+      form.append("post_description", postDescription); // <-- NEW FIELD
       form.append("language", language);
       form.append("target", target);
       form.append("link", link);
@@ -426,181 +366,131 @@ client.on("interactionCreate", async (interaction) => {
         contentType: attachment.contentType || "image/jpeg",
       });
 
-      const n8nResp = await axios.post(n8nDraftUrl, form, {
+      const n8nResp = await axios.post(N8N_DRAFT_WEBHOOK_URL, form, {
         headers: form.getHeaders(),
-        timeout: 120_000,
+        timeout: 120000,
         maxBodyLength: Infinity,
         validateStatus: () => true,
       });
 
-      const rawPayload = n8nResp.data;
-      const data = normalizeN8nResponse(rawPayload);
+      const data = normalizeN8nResponse(n8nResp.data) || {};
+      const approvalToken = String(data.approval_token || "").trim();
+      const stableMediaUrl = String(data.stable_media_url || "").trim();
 
-      if (!data) {
-        throw new Error(`n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`);
-      }
-      if (!data.ok) {
-        throw new Error(data.error || "n8n returned ok=false");
-      }
+      // Create thread + message summary
+      const parentChannel = interaction.channel?.isThread?.()
+        ? interaction.channel.parent
+        : interaction.channel;
 
-      // 3) create thread
-      const threadTitle = `Bozza social • ${new Date().toLocaleDateString("it-IT")} • ${interaction.user.username}`;
-      const thread = await interaction.channel.threads.create({
-        name: threadTitle.slice(0, 95),
-        autoArchiveDuration: 1440,
-        reason: "Auto post social draft",
+      const baseName = `Bozza • ${brand} • ${new Date().toLocaleString("it-IT")}`;
+      const msg = await parentChannel.send({
+        content:
+          `🧾 **Bozza pronta**\n` +
+          `• Brand: **${brand}**\n` +
+          `• Lingua: **${language}**\n` +
+          `• Target: **${target}**\n` +
+          (link ? `• Link: ${link}\n` : "") +
+          (postDescription ? `• Descrizione post: ${postDescription}\n` : "") +
+          (stableMediaUrl ? `• Media: ${stableMediaUrl}\n` : "") +
+          (approvalToken ? `• Token: \`${approvalToken}\`\n` : ""),
       });
 
-      // 4) send header message and capture message id (draft_message_id)
-      const header =
-        `🧾 **BOZZA GENERATA (PENDING APPROVAL)**\n` +
-        `👤 Richiesta da: **${interaction.user.username}**\n` +
-        `🧩 Token: \`${data.approval_token}\`\n` +
-        (data.stable_media_url ? `🖼️ Media: ${data.stable_media_url}\n` : "") +
-        `\n✅ Per pubblicare (nel thread):\n` +
-        `- \`/approvato piattaforma:facebook conferma:si\`\n` +
-        `- \`/approvato piattaforma:instagram conferma:si\`\n` +
-        `- \`/approvato piattaforma:x conferma:si\`\n` +
-        `- \`/approvato piattaforma:all conferma:si\`\n` +
-        `\n⛔ Per annullare:\n` +
-        `- \`/approvato piattaforma:all conferma:no\`\n` +
-        `\n(Se serve forzare token: \`/approvato piattaforma:all conferma:si token:${data.approval_token}\`)`;
+      const thread = await msg.startThread({
+        name: baseName.slice(0, 98),
+        autoArchiveDuration: 1440,
+      });
 
-      const headerMsg = await thread.send(header);
-      const draftMessageId = headerMsg?.id || "";
-
-      // 5) link thread -> token + save draft_message_id
+      // Save link in sheet via n8n link-thread
       await linkThreadToToken({
         threadId: thread.id,
-        approvalToken: data.approval_token,
-        draftMessageId,
-        stableMediaUrl: data.stable_media_url,
+        approvalToken,
+        draftMessageId: msg.id,
+        stableMediaUrl,
         guildId: interaction.guildId,
         channelId: interaction.channelId,
         user: interaction.user?.username,
       });
 
-      // 6) send platform blocks
-      const blocks = [
-        { title: "INSTAGRAM", body: data.ig_caption },
-        { title: "FACEBOOK", body: data.fb_text },
-        { title: "X", body: data.x_text },
-        { title: "TIKTOK", body: data.tiktok_caption },
-        { title: "SIGNAL", body: data.signal_text },
-      ];
-
-      for (const b of blocks) {
-        const txt = `**${b.title}**\n${b.body || "(vuoto)"}`;
-        for (const part of chunkText(txt)) {
-          await thread.send(part);
-        }
-      }
-
-      await safeEdit(interaction, `✅ Bozza creata nel thread: <#${thread.id}>`);
-      return;
-    } catch (err) {
-      const status = err?.response?.status;
-      const respData = err?.response?.data;
-      const msg = err?.message;
-
-      console.error("❌ /post failed:", { status, respData, msg });
-
-      await safeEdit(
-        interaction,
-        `❌ Errore generazione bozza.\n` +
-          `status: ${status ?? "n/a"}\n` +
-          `msg: ${msg ?? "n/a"}\n` +
-          `data: ${respData ? String(respData).slice(0, 800) : "n/a"}`
-      );
-      return;
+      await safeEdit(interaction, {
+        content:
+          `✅ Bozza creata!\n` +
+          `Apri il thread: <#${thread.id}>\n` +
+          `Per approvare:\n` +
+          `\`/approvato piattaforma:instagram conferma:si\` (nel thread)\n` +
+          `oppure passa anche \`token:\`${approvalToken}\`\` fuori dal thread.`,
+      });
+    } catch (e) {
+      console.error("/post failed:", e?.response?.status, e?.message);
+      await safeEdit(interaction, {
+        content: `❌ Errore creando la bozza. Dettaglio: ${e?.message || "unknown"}`,
+      });
     }
+    return;
   }
 
-  /** -------- /approvato -------- */
+  /* -------- /approvato -------- */
   if (interaction.commandName === "approvato") {
     const ok = await safeDefer(interaction);
     if (!ok) return;
 
     const platform = interaction.options.getString("piattaforma", true);
-    const confirm = (interaction.options.getString("conferma", true) || "no").toLowerCase();
-    const tokenOpt = interaction.options.getString("token", false);
+    const confirm = interaction.options.getString("conferma", true);
+    const tokenOpt = interaction.options.getString("token") || "";
 
-    // se conferma = NO, annulla e stop
-    if (confirm !== "si") {
-      await safeEdit(interaction, `⛔ Operazione annullata (conferma:NO). Nessun post pubblicato.`);
+    if (confirm === "no") {
+      await safeEdit(interaction, { content: "🛑 Operazione annullata (conferma=no)." });
       return;
     }
 
     const approvalToken = await resolveApprovalToken(interaction, tokenOpt);
-
     if (!approvalToken) {
-      await safeEdit(
-        interaction,
-        `❌ Token mancante.\n` +
-          `Usa il comando *nel thread della bozza* (consigliato) oppure passa il token:\n` +
-          `\`/approvato piattaforma:${platform} conferma:si token:XXXX\``
-      );
+      await safeEdit(interaction, {
+        content:
+          `❌ Token mancante.\n` +
+          `Usa il comando **nel thread della bozza** (consigliato) oppure passa il token:\n` +
+          `\`/approvato piattaforma:${platform} conferma:si token:XXXX\``,
+      });
       return;
     }
 
     try {
       const resp = await axios.post(
-        n8nApproveUrl,
-        { approval_token: approvalToken, platform },
-        { timeout: 90_000, validateStatus: () => true }
+        N8N_APPROVE_WEBHOOK_URL,
+        {
+          platform,
+          approval_token: approvalToken,
+          discord_guild_id: interaction.guildId || "",
+          discord_channel_id: interaction.channelId || "",
+          discord_user: interaction.user?.username || "",
+        },
+        { timeout: 60000, validateStatus: () => true }
       );
 
-      const rawPayload = resp.data;
-      const data = normalizeN8nResponse(rawPayload);
+      const data = normalizeN8nResponse(resp.data) || {};
+      const okResp = !!data.ok;
 
-      if (!data) {
-        throw new Error(`n8n returned non-JSON text: ${String(rawPayload).slice(0, 500)}`);
-      }
-      if (!data.ok) {
-        throw new Error(data.error || "n8n returned ok=false");
-      }
-
-      await safeEdit(
-        interaction,
-        `✅ Approvazione inviata → **${platform.toUpperCase()}** (token: \`${approvalToken}\`)`
-      );
-
-      try {
-        await interaction.channel.send(
-          `✅ **APPROVATO** → **${platform.toUpperCase()}**\nToken: \`${approvalToken}\``
-        );
-      } catch (e) {
-        console.error("channel.send failed:", e?.code || e?.message);
-      }
-    } catch (err) {
-      const status = err?.response?.status;
-      const respData = err?.response?.data;
-      const msg = err?.message;
-
-      console.error("❌ /approvato failed:", { status, respData, msg });
-
-      await safeEdit(
-        interaction,
-        `❌ Errore approvazione.\n` +
-          `status: ${status ?? "n/a"}\n` +
-          `msg: ${msg ?? "n/a"}\n` +
-          `data: ${respData ? String(respData).slice(0, 800) : "n/a"}`
-      );
+      await safeEdit(interaction, {
+        content: okResp
+          ? `✅ Approvato e inviato a n8n.\nPiattaforma: **${platform}**\nToken: \`${approvalToken}\``
+          : `⚠️ n8n ha risposto ma con esito non-ok.\nPiattaforma: **${platform}**\nToken: \`${approvalToken}\`\nDettaglio: ${JSON.stringify(data).slice(0, 1500)}`,
+      });
+    } catch (e) {
+      console.error("/approvato failed:", e?.response?.status, e?.message);
+      await safeEdit(interaction, { content: `❌ Errore: ${e?.message || "unknown"}` });
     }
   }
 });
 
-/** =========================
- *  READY
- *  ========================= */
-client.once("ready", () => {
-  console.log(`🤖 Logged as ${client.user.tag}`);
-});
-
-/** =========================
- *  START
+/* =========================
+ *  BOOT
  *  ========================= */
 (async () => {
   await registerCommands();
-  await client.login(token);
+
+  client.once("ready", () => {
+    console.log(`🤖 Logged in as ${client.user?.tag}`);
+  });
+
+  // IMPORTANT: token is trimmed and must be pure token string
+  await client.login(DISCORD_TOKEN_RAW);
 })();
